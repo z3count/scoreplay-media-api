@@ -474,18 +474,172 @@ common AND case first.
 
 ### 3. Multi-tenancy
 
-The whole schema is single-tenant. ScorePlay's real use case is multiple
-sports orgs (clubs, leagues, federations) sharing the platform; a club's
-media must never leak to another. Two common patterns:
+ScorePlay's real use case is multiple sports orgs (clubs, leagues,
+federations) sharing the platform; a club's media must never leak to
+another. **Phase 1 has shipped**: schema, ports, repository filtering,
+storage prefixing, scope-gated handlers, and the load-bearing
+cross-tenant isolation test. **Phase 2 (Row-Level Security as
+defence-in-depth)** is deferred — it needs per-connection state
+plumbing that's a separate refactor. The application-level WHERE
+clauses + the integration test cover the correctness guarantee today.
 
-- **Tenant column** on every table (`tenant_id UUID NOT NULL`) plus a
-  `WHERE tenant_id = $current` predicate on every query, enforced by a
-  middleware that injects the tenant from a verified JWT.
-- **Database-per-tenant** for stronger isolation and easier per-tenant
-  backups, at the cost of more operational surface.
+**Shape (decisions taken)**
 
-Either way, the port/adapter split here means the tenant ID would flow as
-a context value, not as a new method parameter.
+- **B2B only.** Tenants are other systems (clubs, leagues, federations).
+  Authentication is via DB-backed API keys — one or more per tenant.
+  No JWT/OIDC, no end-user accounts, no signup UI.
+- **Tens of tenants.** Single Postgres, no sharding. Isolation via a
+  `tenant_id UUID NOT NULL` column on every domain table, with Postgres
+  Row-Level Security policies as defence-in-depth.
+- **Prefix-per-tenant storage.** S3 keys become
+  `<tenant_id>/<uuid>.<ext>` — one bucket, one IAM policy, prefix
+  identifies ownership.
+- **Authorisation via scopes** on each API key (`media:write`,
+  `tags:read`, `admin:*`). Handlers gate with
+  `identity.HasScope(...)`. Avoids a full RBAC engine.
+
+**Schema additions**
+
+- `tenants` table: `id UUID PK`, `name`, `status` (`active`/`suspended`),
+  `created_at`.
+- `api_keys` table: `id`, `tenant_id FK`, `hash` (SHA-256 of the raw
+  key — only the hash is stored), `name`, `scopes JSONB`, `created_at`,
+  `expires_at` (nullable), `last_used_at`.
+- `tenant_id UUID NOT NULL` column on every existing domain table
+  (`tags`, `media`, `media_tags`, `jobs`, `idempotency_keys`); composite
+  indexes `(tenant_id, …)` replace single-column ones where the tenant
+  filter would otherwise leave the index unfilterable.
+- RLS policies on each table:
+  `ENABLE ROW LEVEL SECURITY` + `USING (tenant_id = current_setting('app.tenant_id')::uuid)`.
+  The repository's acquire-conn path executes
+  `SET LOCAL app.tenant_id = '<uuid>'` from the request context, and
+  Postgres enforces the filter server-side regardless of what the
+  application SQL says.
+
+**Ports & wiring**
+
+- New `port.AuthVerifier`: `Verify(ctx, rawKey) (Identity, error)`.
+  Returns `Identity{TenantID, KeyID, Scopes, ExpiresAt}` or a sentinel
+  error (`ErrKeyExpired`, `ErrKeyRevoked`).
+- `postgres.AuthVerifier` adapter: looks up the SHA-256 hash, returns
+  the joined `tenants` + `api_keys` row. Hot keys cached in-memory
+  with a short TTL (~5 s) to avoid a DB hit per request.
+- `APIKeyAuth` middleware shrinks to: extract bearer → `Verify` →
+  stash `Identity` in context → set `app.tenant_id` session var for
+  the downstream DB connection.
+- `RateLimit` middleware keys by `Identity.TenantID` once auth has
+  run (falls back to `RemoteAddr` on unauthenticated routes).
+- `Storage.Save` reads the tenant from context and prepends the
+  prefix when building the S3 key.
+
+**Migration order (no downtime)**
+
+1. **✓ Shipped (migration 005).** Created `tenants` + `api_keys` tables
+   and pre-provisioned the legacy tenant (id
+   `00000000-0000-0000-0000-000000000001`). `AuthVerifier.EnsureLegacyTenant`
+   on startup registers the static `API_KEY` (if set) as that tenant's
+   first key with scope `admin:*`.
+2. **✓ Shipped (migration 005).** Added `tenant_id` column with a
+   default of the legacy tenant UUID on every domain table; existing
+   rows backfilled automatically. The default is dropped at the end of
+   the migration so new writes must be explicit.
+3. **✓ Shipped.** Landed `port.AuthVerifier` + the postgres adapter
+   (`internal/adapter/postgres/auth_verifier.go`); the middleware uses
+   it for every request.
+4. **✓ Shipped.** Plumbed `Identity` through `r.Context()`; every
+   repository method calls `port.TenantIDFromContext` and includes
+   `tenant_id` in INSERT / SELECT / UPDATE / DELETE. Storage adapters
+   prefix the key with `<tenant_id>/…`.
+5. **Phase 2 (deferred).** Enable RLS on each table. Needs the
+   repository acquire-conn path to run `SET LOCAL app.tenant_id = …`
+   at the start of every request-scoped transaction. That's a separate
+   refactor; the WHERE clauses already filter today and the isolation
+   test enforces the contract.
+6. **✓ Shipped.** Cut over `APIKeyAuth` to the new verifier. Dev-mode
+   bypass (`API_KEY=""` → legacy tenant identity) preserved for local
+   development.
+7. **✓ Shipped.** The migration drops the `tenant_id` default after
+   backfill, so new writes must be explicit. With RLS still pending,
+   the application-level WHERE clauses + the cross-tenant integration
+   test give two layers of "this query is tenant-scoped" today; Phase 2
+   adds the third.
+
+**Tests**
+
+The load-bearing test is **cross-tenant data isolation**.
+`internal/e2e/multitenancy_test.go` exercises it against a real Postgres
++ local-disk fixture and is what guards correctness today.
+
+- **✓ Integration — cross-tenant isolation** (testcontainers,
+  `internal/e2e/multitenancy_test.go`). Two tenants, two keys, two
+  media. Asserts: tenant-prefixed storage paths are distinct; the same
+  tag name in both tenants is allowed; each tenant's list endpoints
+  return only their own rows; cross-tenant GET / DELETE / attach
+  return 404 (enumeration-safe); the same Idempotency-Key value used
+  by two tenants returns each tenant's own cached row (not the
+  other's).
+- **✓ E2E (existing functional suite)** — all 47+ pre-tenancy tests
+  re-pass against the migrated schema; the legacy tenant absorbs
+  everything they create.
+- **Open — Unit (`AuthVerifier`)** — happy path, expired key, revoked
+  key, unknown key, malformed bearer; scope evaluation
+  (`Identity.HasScope("media:write")`). The verifier is covered
+  indirectly by the isolation E2E today; explicit unit tests would
+  catch error-classification regressions earlier.
+- **Open — Unit (`APIKeyAuth` middleware)** — same rationale.
+- **Phase 2 — Integration (RLS backstop)** — set `app.tenant_id` to
+  tenant A and execute the same SQL the app would issue *without* the
+  application-level WHERE clause; Postgres must still filter to A only.
+  Lands together with the RLS policies.
+- **Open — Load (rate-limit isolation)** — flood tenant A; tenant B
+  remains responsive.
+
+### 3a. Multi-tenancy — explicitly out of scope
+
+Each item below would land as a follow-up only when a real product
+requirement appears. They are *not* implied by the plan above.
+
+- **B2C / end-user identity.** No user accounts within a tenant, no
+  signup UI, password resets, MFA. If a tenant needs end-user logins
+  for people inside their org, plug an external IdP (Auth0, Cognito,
+  Clerk) and map their user ID onto a `Subject` field in `Identity` —
+  the verifier interface won't change.
+- **Self-service tenant lifecycle.** No signup, suspension,
+  reinstatement, or hard-delete flows. Tenants and initial keys are
+  provisioned manually via SQL or a small admin endpoint guarded by
+  the `admin:*` scope.
+- **Schema-per-tenant or DB-per-tenant.** Not justified at tens of
+  tenants without regulatory drivers. The migration cost is ~10×
+  higher (per-tenant DDL, backups, connection pools) and the
+  `tenant_id` + RLS combination gives the same correctness guarantee
+  at single-DB cost.
+- **Bucket-per-tenant in S3.** Not justified at this scale. Prefix-
+  per-tenant gives ownership in the key. If a single large tenant
+  ever needs Bring-Your-Own-Bucket (data residency, customer-managed
+  encryption keys), the storage adapter gains a per-tenant bucket
+  override reachable through the same `Identity` → `port.FileStorage`
+  flow.
+- **Sharding / horizontal partitioning.** Single Postgres is fine
+  here. Escalation path, if a tenant ever dominates: read replicas
+  first, then logical partitioning by `tenant_id`.
+- **Cross-tenant analytics / admin UI.** No built-in console for
+  cross-tenant queries. Ad-hoc cross-tenant SQL is straightforward
+  once the schema is in place (don't set `app.tenant_id` — RLS will
+  return all rows for a superuser). A real admin UI is a separate
+  product.
+- **Per-tenant billing or usage tracking.** Out of scope. The
+  `tenant` label is added only to a small number of key metrics
+  (`http_requests_total`, `jobs_processed_total`), capped at top-N
+  tenants to bound Prometheus cardinality.
+- **Cross-tenant resource sharing.** e.g. a "global" tag multiple
+  tenants can apply. The schema is strictly partitioned; shared
+  resources would need a separate model (a `shared_tags` table with
+  no `tenant_id`, joined into both tenants' views).
+- **CloudFront signed cookies per tenant.** Presigned URLs from
+  `Storage.URLWithExpiry` are enough for private-tier media. We are
+  not adding CDN-tier signing.
+- **mTLS between tenants and the service.** API keys over HTTPS are
+  the contract.
 
 ### 4. Soft delete + retention
 

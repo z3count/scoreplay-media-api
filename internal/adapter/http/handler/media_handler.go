@@ -71,6 +71,9 @@ func NewMediaHandler(svc *service.MediaService, logger *slog.Logger, maxUploadSi
 //   - 422: referenced tag ID does not exist
 //   - 500: storage or database error
 func (h *MediaHandler) Create(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeMediaWrite) {
+		return
+	}
 	// Step 1: Limit body size.
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxUploadSize)
 
@@ -170,6 +173,9 @@ func (h *MediaHandler) Create(w http.ResponseWriter, r *http.Request) {
 //   - 404: no media with the given ID
 //   - 500: database error
 func (h *MediaHandler) GetByID(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeMediaRead) {
+		return
+	}
 	idStr := chi.URLParam(r, "id")
 	id, err := uuid.Parse(idStr)
 	if err != nil {
@@ -203,6 +209,9 @@ func (h *MediaHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 // Returns a page of media ordered by creation date (newest first) and a
 // nextCursor for the following page (empty when there are no more items).
 func (h *MediaHandler) List(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeMediaRead) {
+		return
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	cursor := r.URL.Query().Get("cursor")
 
@@ -245,6 +254,9 @@ func (h *MediaHandler) List(w http.ResponseWriter, r *http.Request) {
 //   - 404: no media with the given ID
 //   - 500: database or storage error
 func (h *MediaHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeMediaWrite) {
+		return
+	}
 	idStr := chi.URLParam(r, "id")
 	id, err := uuid.Parse(idStr)
 	if err != nil {
@@ -273,6 +285,9 @@ func (h *MediaHandler) Delete(w http.ResponseWriter, r *http.Request) {
 //   - 404 NOT_FOUND      — no media with that id, or a referenced tag id doesn't exist
 //   - 415                — Content-Type is not application/json (CSRF guard)
 func (h *MediaHandler) AttachTags(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeMediaWrite) {
+		return
+	}
 	idStr := chi.URLParam(r, "id")
 	mediaID, err := uuid.Parse(idStr)
 	if err != nil {
@@ -323,6 +338,9 @@ func (h *MediaHandler) AttachTags(w http.ResponseWriter, r *http.Request) {
 //   - 400 VALIDATION     — invalid media or tag UUID
 //   - 404 NOT_FOUND      — no media with that id
 func (h *MediaHandler) DetachTag(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeMediaWrite) {
+		return
+	}
 	mediaID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "invalid media ID format")

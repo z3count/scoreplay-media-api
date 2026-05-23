@@ -88,7 +88,11 @@ func TestE2E_S3Backend(t *testing.T) {
 	mediaHandler := handler.NewMediaHandler(mediaSvc, logger, 10*1024*1024)
 	healthHandler := handler.NewHealthHandler(pgEnv.db)
 	idempotencyStore := pgadapter.NewIdempotencyStore(pgEnv.db)
-	router := appserver.NewRouter(healthHandler, tagHandler, mediaHandler, t.TempDir(), testAPIKey, nil, 30*time.Second, 100, 200, idempotencyStore, logger)
+	authVerifier := pgadapter.NewAuthVerifier(pgEnv.db, 0)
+	if err := authVerifier.EnsureLegacyTenant(ctx, testAPIKey); err != nil {
+		t.Fatalf("ensure legacy tenant: %v", err)
+	}
+	router := appserver.NewRouter(healthHandler, tagHandler, mediaHandler, t.TempDir(), authVerifier, nil, nil, 30*time.Second, 100, 200, idempotencyStore, logger)
 
 	srv := &http.Server{Handler: router}
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")

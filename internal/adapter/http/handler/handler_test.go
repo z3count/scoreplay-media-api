@@ -50,6 +50,17 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// withTestIdentity attaches an Identity to the request's context so the
+// scope-check helper in handler/scope.go sees a valid principal. Unit
+// tests bypass the auth middleware (which would normally populate the
+// context); this gives them the same effect inline.
+func withTestIdentity(r *http.Request) *http.Request {
+	return r.WithContext(port.WithIdentity(r.Context(), domain.Identity{
+		TenantID: domain.LegacyTenantID,
+		Scopes:   []string{"admin:*"},
+	}))
+}
+
 // --- Tag Handler Tests ---
 
 // TestTagHandler_Create_Success tests the happy path for tag creation via HTTP.
@@ -62,7 +73,7 @@ func TestTagHandler_Create_Success(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	h.Create(rr, req)
+	h.Create(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusCreated {
 		t.Errorf("expected 201, got %d; body: %s", rr.Code, rr.Body.String())
@@ -88,7 +99,7 @@ func TestTagHandler_Create_InvalidJSON(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	h.Create(rr, req)
+	h.Create(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rr.Code)
@@ -105,7 +116,7 @@ func TestTagHandler_Create_EmptyName(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
-	h.Create(rr, req)
+	h.Create(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rr.Code)
@@ -123,7 +134,7 @@ func TestTagHandler_Create_Security_WrongContentType(t *testing.T) {
 	req.Header.Set("Content-Type", "text/plain")
 	rr := httptest.NewRecorder()
 
-	h.Create(rr, req)
+	h.Create(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusUnsupportedMediaType {
 		t.Errorf("Security: expected 415 for text/plain, got %d; body: %s", rr.Code, rr.Body.String())
@@ -143,7 +154,7 @@ func TestTagHandler_List_Success(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/tags?limit=10&offset=0", nil)
 	rr := httptest.NewRecorder()
 
-	h.List(rr, req)
+	h.List(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rr.Code)
@@ -164,7 +175,7 @@ func TestMediaHandler_GetByID_InvalidUUID(t *testing.T) {
 	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, rctx)
 	req = req.WithContext(ctx)
 
-	h.GetByID(rr, req)
+	h.GetByID(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", rr.Code)
@@ -186,7 +197,7 @@ func TestMediaHandler_GetByID_NotFound(t *testing.T) {
 	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, rctx)
 	req = req.WithContext(ctx)
 
-	h.GetByID(rr, req)
+	h.GetByID(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected 404, got %d", rr.Code)
@@ -210,7 +221,7 @@ func TestMediaHandler_Create_MissingName(t *testing.T) {
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	rr := httptest.NewRecorder()
 
-	h.Create(rr, req)
+	h.Create(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d; body: %s", rr.Code, rr.Body.String())
@@ -233,7 +244,7 @@ func TestMediaHandler_Create_MissingFile(t *testing.T) {
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	rr := httptest.NewRecorder()
 
-	h.Create(rr, req)
+	h.Create(rr, withTestIdentity(req))
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d; body: %s", rr.Code, rr.Body.String())

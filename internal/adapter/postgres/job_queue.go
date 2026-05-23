@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/scoreplay/media-api/internal/domain"
+	"github.com/scoreplay/media-api/internal/port"
 )
 
 // JobQueue implements port.JobQueue using PostgreSQL.
@@ -28,22 +29,34 @@ func NewJobQueue(db *sql.DB) *JobQueue {
 	return &JobQueue{db: db}
 }
 
-// Enqueue inserts a new job into the queue. Returns the generated UUID.
+// Enqueue inserts a new job into the queue, stamped with the producer's
+// tenant id from context. The worker re-establishes that tenant in the
+// handler's context at dequeue time so any downstream repo/storage call
+// inherits the right scope.
 func (q *JobQueue) Enqueue(ctx context.Context, jobType string, payload json.RawMessage) (uuid.UUID, error) {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
 	if payload == nil {
 		payload = json.RawMessage("{}")
 	}
 
 	var id uuid.UUID
-	err := q.db.QueryRowContext(ctx,
-		`INSERT INTO jobs (type, payload) VALUES ($1, $2) RETURNING id`,
-		jobType, payload,
+	err = q.db.QueryRowContext(ctx,
+		`INSERT INTO jobs (tenant_id, type, payload) VALUES ($1, $2, $3) RETURNING id`,
+		tenantID, jobType, payload,
 	).Scan(&id)
 
 	return id, err
 }
 
 // Dequeue atomically picks the next pending job and marks it as running.
+//
+// This is the *system-side* of the worker pipeline: the worker process
+// is not a tenant, so the query is not tenant-scoped. The returned job
+// carries its TenantID; the worker uses it to re-establish a
+// tenant-scoped context before invoking the handler.
 //
 // The query uses SELECT FOR UPDATE SKIP LOCKED to ensure that multiple
 // workers never pick the same job:
@@ -67,10 +80,10 @@ func (q *JobQueue) Dequeue(ctx context.Context) (*domain.Job, error) {
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
-		RETURNING id, type, payload, status, result, error, attempts, max_attempts,
+		RETURNING id, tenant_id, type, payload, status, result, error, attempts, max_attempts,
 		          scheduled_at, started_at, completed_at, created_at
 	`).Scan(
-		&job.ID, &job.Type, &payload, &job.Status, &result, &job.Error,
+		&job.ID, &job.TenantID, &job.Type, &payload, &job.Status, &result, &job.Error,
 		&job.Attempts, &job.MaxAttempts, &job.ScheduledAt, &startedAt,
 		&completedAt, &job.CreatedAt,
 	)

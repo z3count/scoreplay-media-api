@@ -136,8 +136,16 @@ func setupTestEnv(t *testing.T) *testEnv {
 	healthHandler := handler.NewHealthHandler(db)
 	idempotencyStore := pgadapter.NewIdempotencyStore(db)
 
-	// Configure router with a test API key.
-	router := appserver.NewRouter(healthHandler, tagHandler, mediaHandler, uploadDir, testAPIKey, nil, 30*time.Second, 100, 200, idempotencyStore, logger)
+	// Auth: provision the legacy tenant and register testAPIKey against it
+	// (same bootstrap path main.go uses).
+	authVerifier := pgadapter.NewAuthVerifier(db, 0) // cacheTTL=0 for tests
+	if err := authVerifier.EnsureLegacyTenant(ctx, testAPIKey); err != nil {
+		t.Fatalf("ensure legacy tenant: %v", err)
+	}
+
+	// Configure router with the verifier; no dev bypass (devTenantID=nil)
+	// so the tests exercise real auth.
+	router := appserver.NewRouter(healthHandler, tagHandler, mediaHandler, uploadDir, authVerifier, nil, nil, 30*time.Second, 100, 200, idempotencyStore, logger)
 
 	// Step 5: Start HTTP server on a random port.
 	srv := &http.Server{

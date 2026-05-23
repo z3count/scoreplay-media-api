@@ -8,50 +8,64 @@
 // The API key is read from the X-API-Key header (preferred for programmatic
 // clients) or the Authorization: Bearer <key> header (standard OAuth2-style).
 //
-// When no API key is configured (empty string), the middleware is a no-op,
-// allowing unprotected local development. In production, the API_KEY
-// environment variable MUST be set.
+// Multi-tenancy
+// -------------
+// The middleware delegates credential verification to a port.AuthVerifier,
+// which returns a domain.Identity{TenantID, Scopes, …}. The identity is
+// stashed in the request context via port.WithIdentity so handlers and
+// repositories can scope every operation per-tenant. See DESIGN.md §3.
+//
+// Dev mode: if devTenantID is non-nil, an unauthenticated request is
+// allowed and treated as if it came from that tenant with admin:* scope.
+// This preserves the pre-tenancy behaviour where `API_KEY=""` disables
+// auth for local development.
 package middleware
 
 import (
-	"crypto/subtle"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/google/uuid"
+	"github.com/scoreplay/media-api/internal/domain"
+	"github.com/scoreplay/media-api/internal/port"
 )
 
-// APIKeyAuth returns a middleware that validates API key authentication.
+// APIKeyAuth returns a middleware that authenticates each request via the
+// provided AuthVerifier and stashes the resulting Identity in the request
+// context.
 //
-// Security: uses constant-time comparison (subtle.ConstantTimeCompare) to
-// prevent timing attacks that could leak the key length or prefix.
+// Behaviour:
+//   - No credential AND devTenantID != nil → pass with the dev identity.
+//   - No credential AND devTenantID == nil → 401 (auth required).
+//   - Credential present → call verifier.Verify; on success, stash identity.
+//   - Verify returns ErrKeyExpired/ErrKeyRevoked → 401 with a specific reason.
+//   - Verify returns any other error → 401 with reason "invalid".
 //
-// If apiKey is empty, authentication is disabled (development mode).
-//
-// OWASP Logging: all authentication failures are logged with structured
-// fields (remote_addr, method, path) to enable brute-force detection
-// and security monitoring.
-func APIKeyAuth(apiKey string, logger ...*slog.Logger) func(http.Handler) http.Handler {
-	// Accept optional logger to maintain backward compatibility.
-	var log *slog.Logger
-	if len(logger) > 0 && logger[0] != nil {
-		log = logger[0]
-	}
+// Failures are logged with slog (remote_addr only — never the key) and
+// the http_auth_failures_total counter is bumped per reason label.
+func APIKeyAuth(verifier port.AuthVerifier, devTenantID *uuid.UUID, logger *slog.Logger) func(http.Handler) http.Handler {
 	metrics := NewMetrics()
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Security: Skip auth when no key is configured (dev mode only).
-			if apiKey == "" {
-				next.ServeHTTP(w, r)
-				return
-			}
-
 			provided := extractAPIKey(r)
+
 			if provided == "" {
-				// OWASP: Log missing API key attempts for brute-force detection.
+				if devTenantID != nil {
+					// Dev mode: no credential required. Synthesize an
+					// identity scoped to the dev tenant with full
+					// privileges, so handlers proceed as before.
+					next.ServeHTTP(w, r.WithContext(port.WithIdentity(r.Context(), domain.Identity{
+						TenantID: *devTenantID,
+						Scopes:   []string{"admin:*"},
+					})))
+					return
+				}
 				metrics.IncAuthFailure("missing")
-				if log != nil {
-					log.Warn("auth failure: missing API key",
+				if logger != nil {
+					logger.Warn("auth failure: missing API key",
 						"remote_addr", r.RemoteAddr,
 						"method", r.Method,
 						"path", r.URL.Path,
@@ -61,24 +75,43 @@ func APIKeyAuth(apiKey string, logger ...*slog.Logger) func(http.Handler) http.H
 				return
 			}
 
-			// Security: Constant-time comparison prevents timing side-channel attacks.
-			if subtle.ConstantTimeCompare([]byte(provided), []byte(apiKey)) != 1 {
-				// OWASP: Log invalid API key attempts for brute-force detection.
-				// Do NOT log the provided key to avoid leaking credentials.
-				metrics.IncAuthFailure("invalid")
-				if log != nil {
-					log.Warn("auth failure: invalid API key",
+			identity, err := verifier.Verify(r.Context(), provided)
+			if err != nil {
+				reason, message := classifyAuthError(err)
+				metrics.IncAuthFailure(reason)
+				if logger != nil {
+					logger.Warn("auth failure",
+						"reason", reason,
 						"remote_addr", r.RemoteAddr,
 						"method", r.Method,
 						"path", r.URL.Path,
 					)
 				}
-				writeAuthError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid API key")
+				writeAuthError(w, http.StatusUnauthorized, "UNAUTHORIZED", message)
 				return
 			}
 
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(port.WithIdentity(r.Context(), identity)))
 		})
+	}
+}
+
+// classifyAuthError maps a verifier error to a low-cardinality reason
+// label (used as the http_auth_failures_total{reason} value) and a
+// safe client-facing message.
+func classifyAuthError(err error) (reason, message string) {
+	switch {
+	case errors.Is(err, port.ErrKeyMissing):
+		return "missing", "missing API key"
+	case errors.Is(err, port.ErrKeyExpired):
+		return "expired", "credential expired"
+	case errors.Is(err, port.ErrKeyRevoked):
+		return "revoked", "credential revoked"
+	default:
+		// ErrKeyInvalid + any internal error are folded into "invalid"
+		// so an attacker can't probe the difference between "unknown
+		// key" and "DB error" via the response.
+		return "invalid", "invalid API key"
 	}
 }
 

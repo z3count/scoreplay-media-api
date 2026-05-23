@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/scoreplay/media-api/internal/port"
 )
 
 // Storage implements port.FileStorage using the local filesystem.
@@ -82,12 +83,20 @@ func NewStorage(basePath string) (*Storage, error) {
 //
 // Returns the relative path from the storage root (e.g., "4/f/3/uuid.jpg").
 func (s *Storage) Save(ctx context.Context, reader io.Reader, ext string) (string, error) {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return "", err
+	}
+
 	// Generate a UUID-based filename.
 	id := uuid.New().String()
 
-	// Build the sharded directory path: 4/f/3/
-	// Using first 3 characters of the UUID hex string.
-	dirPath := filepath.Join(string(id[0]), string(id[1]), string(id[2]))
+	// Build the sharded directory path: <tenant_id>/4/f/3/
+	// Using first 3 characters of the UUID hex string. Tenant id prefix
+	// gives one-bucket / one-tree-per-tenant on disk; cross-tenant
+	// browsing would require predicting both the tenant UUID and the
+	// media UUID.
+	dirPath := filepath.Join(tenantID.String(), string(id[0]), string(id[1]), string(id[2]))
 	fullDir := filepath.Join(s.basePath, dirPath)
 
 	if err := os.MkdirAll(fullDir, 0750); err != nil {

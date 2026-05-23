@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/scoreplay/media-api/internal/domain"
 	"github.com/scoreplay/media-api/internal/port"
 )
 
@@ -111,6 +112,7 @@ func (w *Worker) processOne(ctx context.Context, workerID int) {
 		"worker", workerID,
 		"job_id", job.ID.String(),
 		"job_type", job.Type,
+		"tenant_id", job.TenantID.String(),
 		"attempt", job.Attempts,
 	)
 	metrics := newWorkerMetrics()
@@ -126,7 +128,16 @@ func (w *Worker) processOne(ctx context.Context, workerID int) {
 	logger.Info("processing job")
 	start := time.Now()
 
-	result, execErr := handler.Execute(ctx, job.Payload)
+	// Re-establish tenant scope for the handler's context — the worker
+	// itself is a system process (no Identity in ctx), but downstream
+	// repos/storage need to know whose data they're operating on. The
+	// handler runs as if it were the producing tenant with admin:*
+	// scope.
+	handlerCtx := port.WithIdentity(ctx, domain.Identity{
+		TenantID: job.TenantID,
+		Scopes:   []string{"admin:*"},
+	})
+	result, execErr := handler.Execute(handlerCtx, job.Payload)
 	metrics.jobDuration.WithLabelValues(job.Type).Observe(time.Since(start).Seconds())
 	if execErr != nil {
 		logger.Error("job failed", "error", execErr)

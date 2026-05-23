@@ -3,6 +3,8 @@ package postgres
 import (
 	"context"
 	"database/sql"
+
+	"github.com/scoreplay/media-api/internal/port"
 )
 
 // IdempotencyStore implements port.IdempotencyStore using PostgreSQL.
@@ -19,14 +21,20 @@ func NewIdempotencyStore(db *sql.DB) *IdempotencyStore {
 }
 
 // Get retrieves a cached response for the given idempotency key.
-// Returns found=false if the key doesn't exist or has expired.
+// Returns found=false if the key doesn't exist or has expired. The
+// lookup is tenant-scoped — tenant A's idempotency key X is a different
+// entry from tenant B's X.
 func (s *IdempotencyStore) Get(ctx context.Context, key string) (int, []byte, bool, error) {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return 0, nil, false, err
+	}
 	var statusCode int
 	var body []byte
-	err := s.db.QueryRowContext(ctx,
+	err = s.db.QueryRowContext(ctx,
 		`SELECT status_code, response FROM idempotency_keys
-		 WHERE key = $1 AND expires_at > now()`,
-		key,
+		 WHERE tenant_id = $1 AND key = $2 AND expires_at > now()`,
+		tenantID, key,
 	).Scan(&statusCode, &body)
 
 	if err == sql.ErrNoRows {
@@ -38,21 +46,27 @@ func (s *IdempotencyStore) Get(ctx context.Context, key string) (int, []byte, bo
 	return statusCode, body, true, nil
 }
 
-// Set stores a response for the given idempotency key.
+// Set stores a response for the given idempotency key, tenant-scoped.
 // Uses INSERT ... ON CONFLICT to handle race conditions where two requests
 // with the same key arrive simultaneously — the first one wins.
 func (s *IdempotencyStore) Set(ctx context.Context, key string, statusCode int, body []byte) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO idempotency_keys (key, status_code, response)
-		 VALUES ($1, $2, $3)
-		 ON CONFLICT (key) DO NOTHING`,
-		key, statusCode, body,
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO idempotency_keys (tenant_id, key, status_code, response)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (tenant_id, key) DO NOTHING`,
+		tenantID, key, statusCode, body,
 	)
 	return err
 }
 
-// Cleanup removes expired idempotency keys.
+// Cleanup removes expired idempotency keys across all tenants.
 // Should be called periodically (e.g. every hour) to prevent table bloat.
+// Not tenant-scoped because it's a system-wide maintenance task — the
+// caller is the background goroutine started in main.go, not a tenant.
 func (s *IdempotencyStore) Cleanup(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM idempotency_keys WHERE expires_at <= now()`,

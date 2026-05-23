@@ -60,14 +60,19 @@ func NewTagRepo(db *sql.DB) *TagRepo {
 //   - Empty or whitespace-only names: should be rejected at the service layer
 //     before reaching this method.
 func (r *TagRepo) CreateOrGet(ctx context.Context, name string) (domain.Tag, bool, error) {
-	// Attempt to insert. If a conflict on name occurs, do nothing.
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return domain.Tag{}, false, err
+	}
+
+	// Attempt to insert. If a conflict on (tenant_id, name) occurs, do nothing.
 	// RETURNING gives us the row only if an insert actually happened.
 	var tag domain.Tag
-	err := r.db.QueryRowContext(ctx,
-		`INSERT INTO tags (name) VALUES ($1)
-		 ON CONFLICT (name) DO NOTHING
+	err = r.db.QueryRowContext(ctx,
+		`INSERT INTO tags (tenant_id, name) VALUES ($1, $2)
+		 ON CONFLICT (tenant_id, name) DO NOTHING
 		 RETURNING id, name, created_at`,
-		name,
+		tenantID, name,
 	).Scan(&tag.ID, &tag.Name, &tag.CreatedAt)
 
 	if err == nil {
@@ -81,10 +86,10 @@ func (r *TagRepo) CreateOrGet(ctx context.Context, name string) (domain.Tag, boo
 	}
 
 	// sql.ErrNoRows means the ON CONFLICT fired (tag already exists).
-	// Fetch the existing tag by name.
+	// Fetch the existing tag by (tenant_id, name).
 	err = r.db.QueryRowContext(ctx,
-		`SELECT id, name, created_at FROM tags WHERE name = $1`,
-		name,
+		`SELECT id, name, created_at FROM tags WHERE tenant_id = $1 AND name = $2`,
+		tenantID, name,
 	).Scan(&tag.ID, &tag.Name, &tag.CreatedAt)
 	if err != nil {
 		return domain.Tag{}, false, fmt.Errorf("select existing tag: %w", err)
@@ -105,24 +110,27 @@ func (r *TagRepo) CreateOrGet(ctx context.Context, name string) (domain.Tag, boo
 // No COUNT(*) is performed: cursor pagination intentionally avoids the
 // linear-time scan that offset-based pagination required.
 func (r *TagRepo) List(ctx context.Context, limit int, cursor *port.TagCursor) ([]domain.Tag, *port.TagCursor, error) {
-	var (
-		rows *sql.Rows
-		err  error
-	)
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var rows *sql.Rows
 	if cursor == nil {
 		rows, err = r.db.QueryContext(ctx,
 			`SELECT id, name, created_at FROM tags
+			 WHERE tenant_id = $1
 			 ORDER BY name ASC, id ASC
-			 LIMIT $1`,
-			limit+1,
+			 LIMIT $2`,
+			tenantID, limit+1,
 		)
 	} else {
 		rows, err = r.db.QueryContext(ctx,
 			`SELECT id, name, created_at FROM tags
-			 WHERE (name, id) > ($1, $2)
+			 WHERE tenant_id = $1 AND (name, id) > ($2, $3)
 			 ORDER BY name ASC, id ASC
-			 LIMIT $3`,
-			cursor.Name, cursor.ID, limit+1,
+			 LIMIT $4`,
+			tenantID, cursor.Name, cursor.ID, limit+1,
 		)
 	}
 	if err != nil {
@@ -165,11 +173,15 @@ func (r *TagRepo) List(ctx context.Context, limit int, cursor *port.TagCursor) (
 // The caller (service) is responsible for sanitizing the name before
 // calling this method.
 func (r *TagRepo) Rename(ctx context.Context, id uuid.UUID, name string) (domain.Tag, error) {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return domain.Tag{}, err
+	}
 	var tag domain.Tag
-	err := r.db.QueryRowContext(ctx,
-		`UPDATE tags SET name = $1 WHERE id = $2
+	err = r.db.QueryRowContext(ctx,
+		`UPDATE tags SET name = $1 WHERE id = $2 AND tenant_id = $3
 		 RETURNING id, name, created_at`,
-		name, id,
+		name, id, tenantID,
 	).Scan(&tag.ID, &tag.Name, &tag.CreatedAt)
 
 	if err == sql.ErrNoRows {
@@ -192,7 +204,11 @@ func (r *TagRepo) Rename(ctx context.Context, id uuid.UUID, name string) (domain
 // rather than a separate SELECT because DELETE is already atomic and
 // reporting "deleted nothing" needs no extra round-trip.
 func (r *TagRepo) Delete(ctx context.Context, id uuid.UUID) error {
-	res, err := r.db.ExecContext(ctx, `DELETE FROM tags WHERE id = $1`, id)
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	res, err := r.db.ExecContext(ctx, `DELETE FROM tags WHERE id = $1 AND tenant_id = $2`, id, tenantID)
 	if err != nil {
 		return fmt.Errorf("delete tag: %w", err)
 	}

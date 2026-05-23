@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -53,28 +52,38 @@ func NewMediaRepo(db *sql.DB) *MediaRepo {
 //     for simplicity. For 1000+ tags per media, a batch approach (COPY or
 //     unnest) would be more efficient, but that's an unlikely scenario.
 func (r *MediaRepo) Create(ctx context.Context, media *domain.Media, tagIDs []uuid.UUID) (*domain.Media, error) {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // Rollback is a no-op if tx was committed.
 
-	// Step 1: Insert the media record.
+	// Step 1: Insert the media record, stamped with the tenant.
 	err = tx.QueryRowContext(ctx,
-		`INSERT INTO media (name, media_type, file_path, original_name, file_size)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO media (tenant_id, name, media_type, file_path, original_name, file_size)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 RETURNING id, created_at`,
-		media.Name, string(media.Type), media.FilePath, media.OriginalName, media.FileSize,
+		tenantID, media.Name, string(media.Type), media.FilePath, media.OriginalName, media.FileSize,
 	).Scan(&media.ID, &media.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert media: %w", err)
 	}
 
-	// Step 2: Insert tag associations.
+	// Step 2: Insert tag associations. Each tag must belong to the same
+	// tenant — the FK on media_tags.tenant_id (with the tag composite key)
+	// rejects cross-tenant pairs automatically, but we double-check by
+	// scoping the tag lookup here.
 	for _, tagID := range tagIDs {
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO media_tags (media_id, tag_id) VALUES ($1, $2)`,
-			media.ID, tagID,
+			`INSERT INTO media_tags (tenant_id, media_id, tag_id)
+			 SELECT $1, $2, $3
+			 WHERE EXISTS (SELECT 1 FROM tags WHERE id = $3 AND tenant_id = $1)`,
+			tenantID, media.ID, tagID,
 		)
 		if err != nil {
 			// FK constraint violation means the tag doesn't exist.
@@ -84,7 +93,7 @@ func (r *MediaRepo) Create(ctx context.Context, media *domain.Media, tagIDs []uu
 
 	// Step 3: Fetch the tags to populate the response.
 	// We re-read from the DB rather than trusting the input to ensure consistency.
-	tags, err := queryMediaTags(ctx, tx, media.ID)
+	tags, err := queryMediaTags(ctx, tx, tenantID, media.ID)
 	if err != nil {
 		return nil, fmt.Errorf("query media tags: %w", err)
 	}
@@ -114,12 +123,19 @@ func (r *MediaRepo) Create(ctx context.Context, media *domain.Media, tagIDs []uu
 //     with a media, the media_tags row is also deleted (ON DELETE CASCADE),
 //     so it simply won't appear in the result.
 func (r *MediaRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.Media, error) {
-	// Fetch the media record.
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch the media record, scoped to the calling tenant. A cross-tenant
+	// request for a real id is treated as 404, not 403 — leaking "this id
+	// exists but isn't yours" would itself be an enumeration vector.
 	var media domain.Media
-	err := r.db.QueryRowContext(ctx,
+	err = r.db.QueryRowContext(ctx,
 		`SELECT id, name, media_type, file_path, original_name, file_size, created_at
-		 FROM media WHERE id = $1`,
-		id,
+		 FROM media WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID,
 	).Scan(&media.ID, &media.Name, &media.Type, &media.FilePath, &media.OriginalName, &media.FileSize, &media.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, domain.ErrNotFound
@@ -129,7 +145,7 @@ func (r *MediaRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.Media, e
 	}
 
 	// Fetch associated tags.
-	tags, err := queryMediaTagsDB(ctx, r.db, media.ID)
+	tags, err := queryMediaTagsDB(ctx, r.db, tenantID, media.ID)
 	if err != nil {
 		return nil, fmt.Errorf("query media tags: %w", err)
 	}
@@ -140,15 +156,17 @@ func (r *MediaRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.Media, e
 
 // queryMediaTags fetches all tags associated with a media item within a transaction.
 // This is used during Create to populate the response without an additional round-trip
-// after the commit.
-func queryMediaTags(ctx context.Context, tx *sql.Tx, mediaID uuid.UUID) ([]domain.Tag, error) {
+// after the commit. Filtered by tenant_id for defence in depth — the caller has
+// already verified ownership via the media row, but a stale media_tags from a
+// schema bug shouldn't leak through.
+func queryMediaTags(ctx context.Context, tx *sql.Tx, tenantID, mediaID uuid.UUID) ([]domain.Tag, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT t.id, t.name, t.created_at
 		 FROM tags t
 		 INNER JOIN media_tags mt ON mt.tag_id = t.id
-		 WHERE mt.media_id = $1
+		 WHERE mt.media_id = $1 AND mt.tenant_id = $2
 		 ORDER BY t.name ASC`,
-		mediaID,
+		mediaID, tenantID,
 	)
 	if err != nil {
 		return nil, err
@@ -160,14 +178,14 @@ func queryMediaTags(ctx context.Context, tx *sql.Tx, mediaID uuid.UUID) ([]domai
 
 // queryMediaTagsDB fetches all tags associated with a media item using a raw *sql.DB.
 // This is used in GetByID where we don't have a transaction context.
-func queryMediaTagsDB(ctx context.Context, db *sql.DB, mediaID uuid.UUID) ([]domain.Tag, error) {
+func queryMediaTagsDB(ctx context.Context, db *sql.DB, tenantID, mediaID uuid.UUID) ([]domain.Tag, error) {
 	rows, err := db.QueryContext(ctx,
 		`SELECT t.id, t.name, t.created_at
 		 FROM tags t
 		 INNER JOIN media_tags mt ON mt.tag_id = t.id
-		 WHERE mt.media_id = $1
+		 WHERE mt.media_id = $1 AND mt.tenant_id = $2
 		 ORDER BY t.name ASC`,
-		mediaID,
+		mediaID, tenantID,
 	)
 	if err != nil {
 		return nil, err
@@ -213,6 +231,11 @@ func scanTags(rows *sql.Rows) ([]domain.Tag, error) {
 // reuse the same join shape for N=1 and N>1. The service layer is
 // responsible for deduplicating the slices so the count predicate matches.
 func (r *MediaRepo) List(ctx context.Context, limit int, cursor *port.MediaCursor, filter port.MediaFilter) ([]*domain.Media, *port.MediaCursor, error) {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var (
 		joins   []string
 		wheres  []string
@@ -225,6 +248,10 @@ func (r *MediaRepo) List(ctx context.Context, limit int, cursor *port.MediaCurso
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+
+	// Tenant scope is the first WHERE — keeps the (tenant_id, created_at DESC, id DESC)
+	// composite index usable for keyset scans.
+	wheres = append(wheres, "m.tenant_id = "+placeholder(tenantID))
 
 	switch {
 	case len(filter.TagIDs) > 0:
@@ -313,10 +340,10 @@ func (r *MediaRepo) List(ctx context.Context, limit int, cursor *port.MediaCurso
 			SELECT mt.media_id, t.id, t.name, t.created_at
 			FROM tags t
 			INNER JOIN media_tags mt ON t.id = mt.tag_id
-			WHERE mt.media_id = ANY($1::uuid[])
+			WHERE mt.media_id = ANY($1::uuid[]) AND mt.tenant_id = $2
 			ORDER BY t.name ASC`
 
-		tagRows, err := r.db.QueryContext(ctx, tagQuery, pq.Array(mediaIDs))
+		tagRows, err := r.db.QueryContext(ctx, tagQuery, pq.Array(mediaIDs), tenantID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("batch query tags: %w", err)
 		}
@@ -349,10 +376,14 @@ func (r *MediaRepo) List(ctx context.Context, limit int, cursor *port.MediaCurso
 //
 // Returns domain.ErrNotFound if no media with the given ID exists.
 func (r *MediaRepo) Delete(ctx context.Context, id uuid.UUID) (string, error) {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return "", err
+	}
 	var filePath string
-	err := r.db.QueryRowContext(ctx,
-		`DELETE FROM media WHERE id = $1 RETURNING file_path`,
-		id,
+	err = r.db.QueryRowContext(ctx,
+		`DELETE FROM media WHERE id = $1 AND tenant_id = $2 RETURNING file_path`,
+		id, tenantID,
 	).Scan(&filePath)
 
 	if err == sql.ErrNoRows {
@@ -364,13 +395,6 @@ func (r *MediaRepo) Delete(ctx context.Context, id uuid.UUID) (string, error) {
 
 	return filePath, nil
 }
-
-// foreignKeyViolation is the PostgreSQL SQLSTATE code raised when an INSERT
-// or UPDATE would violate a FOREIGN KEY constraint — i.e., the referenced
-// row doesn't exist. We detect it on AttachTags to tell the difference
-// between "this tag id is unknown" (client error → 400) and a generic DB
-// failure.
-const foreignKeyViolation = "23503"
 
 // AttachTags inserts (media_id, tag_id) rows for every tag in tagIDs,
 // ignoring associations that already exist via ON CONFLICT DO NOTHING.
@@ -385,9 +409,15 @@ const foreignKeyViolation = "23503"
 // slice as []string and cast back to uuid[] in SQL — same trick used in
 // the cursor list query.
 func (r *MediaRepo) AttachTags(ctx context.Context, mediaID uuid.UUID, tagIDs []uuid.UUID) error {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return err
+	}
+
 	var exists bool
 	if err := r.db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM media WHERE id = $1)`, mediaID,
+		`SELECT EXISTS(SELECT 1 FROM media WHERE id = $1 AND tenant_id = $2)`,
+		mediaID, tenantID,
 	).Scan(&exists); err != nil {
 		return fmt.Errorf("check media exists: %w", err)
 	}
@@ -404,18 +434,38 @@ func (r *MediaRepo) AttachTags(ctx context.Context, mediaID uuid.UUID, tagIDs []
 		idStrs[i] = id.String()
 	}
 
-	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO media_tags (media_id, tag_id)
-		 SELECT $1, unnest($2::uuid[])
+	// INSERT only the (media_id, tag_id) pairs where the tag actually
+	// belongs to the same tenant. Tag IDs that don't exist (or belong to
+	// a different tenant) are dropped by the WHERE clause; we count how
+	// many were inserted to detect that case and return ErrValidation.
+	res, err := r.db.ExecContext(ctx,
+		`INSERT INTO media_tags (tenant_id, media_id, tag_id)
+		 SELECT $1, $2, t.id
+		 FROM tags t
+		 WHERE t.id = ANY($3::uuid[]) AND t.tenant_id = $1
 		 ON CONFLICT (media_id, tag_id) DO NOTHING`,
-		mediaID, pq.Array(idStrs),
+		tenantID, mediaID, pq.Array(idStrs),
 	)
 	if err != nil {
-		var pqErr *pq.Error
-		if errors.As(err, &pqErr) && pqErr.Code == foreignKeyViolation {
+		return fmt.Errorf("attach tags: %w", err)
+	}
+	// If fewer rows were affected than expected, at least one tag id was
+	// either unknown or owned by another tenant. We can't distinguish the
+	// two without an extra query — both map to client-error 400.
+	if rows, _ := res.RowsAffected(); rows < int64(len(tagIDs)) {
+		// Count the ones already present (conflicts) — if every requested
+		// tag is either a valid existing pair or a valid new pair, we're
+		// fine. Otherwise it's a validation error.
+		var validCount int
+		if cErr := r.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM tags WHERE id = ANY($1::uuid[]) AND tenant_id = $2`,
+			pq.Array(idStrs), tenantID,
+		).Scan(&validCount); cErr != nil {
+			return fmt.Errorf("attach tags validation: %w", cErr)
+		}
+		if validCount < len(tagIDs) {
 			return fmt.Errorf("%w: one or more tag IDs do not exist", domain.ErrValidation)
 		}
-		return fmt.Errorf("attach tags: %w", err)
 	}
 	return nil
 }
@@ -430,9 +480,15 @@ func (r *MediaRepo) AttachTags(ctx context.Context, mediaID uuid.UUID, tagIDs []
 // We still do an EXISTS check on the media so the client gets a 404 when
 // the *media* id is wrong (vs. silently succeeding on a typo).
 func (r *MediaRepo) DetachTag(ctx context.Context, mediaID, tagID uuid.UUID) error {
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return err
+	}
+
 	var exists bool
 	if err := r.db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM media WHERE id = $1)`, mediaID,
+		`SELECT EXISTS(SELECT 1 FROM media WHERE id = $1 AND tenant_id = $2)`,
+		mediaID, tenantID,
 	).Scan(&exists); err != nil {
 		return fmt.Errorf("check media exists: %w", err)
 	}
@@ -441,8 +497,8 @@ func (r *MediaRepo) DetachTag(ctx context.Context, mediaID, tagID uuid.UUID) err
 	}
 
 	if _, err := r.db.ExecContext(ctx,
-		`DELETE FROM media_tags WHERE media_id = $1 AND tag_id = $2`,
-		mediaID, tagID,
+		`DELETE FROM media_tags WHERE media_id = $1 AND tag_id = $2 AND tenant_id = $3`,
+		mediaID, tagID, tenantID,
 	); err != nil {
 		return fmt.Errorf("detach tag: %w", err)
 	}

@@ -63,6 +63,9 @@ func NewTagHandler(svc *service.TagService, logger *slog.Logger) *TagHandler {
 //   - Content-Type not application/json → still works (Go's json.Decoder doesn't
 //     check Content-Type), but clients should send the correct header.
 func (h *TagHandler) Create(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeTagsWrite) {
+		return
+	}
 	// Validate Content-Type to prevent CSRF via text/plain requests.
 	// Browsers don't send preflight CORS for text/plain, so without this check
 	// a malicious page could POST to the API without triggering CORS.
@@ -110,6 +113,9 @@ func (h *TagHandler) Create(w http.ResponseWriter, r *http.Request) {
 //   - limit=500 → capped to 100 by service layer.
 //   - Malformed cursor → 400 VALIDATION_ERROR.
 func (h *TagHandler) List(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeTagsRead) {
+		return
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	cursor := r.URL.Query().Get("cursor")
 
@@ -168,6 +174,9 @@ func (h *TagHandler) handleError(w http.ResponseWriter, r *http.Request, err err
 //   - 409 — the new name is already used by a different tag.
 //   - 415 — Content-Type is not application/json (CSRF guard).
 func (h *TagHandler) Update(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeTagsWrite) {
+		return
+	}
 	idStr := chi.URLParam(r, "id")
 	id, err := uuid.Parse(idStr)
 	if err != nil {
@@ -206,6 +215,9 @@ func (h *TagHandler) Update(w http.ResponseWriter, r *http.Request) {
 //   - 400 — invalid UUID.
 //   - 404 — no tag with that id.
 func (h *TagHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	if !requireScope(w, r, ScopeTagsWrite) {
+		return
+	}
 	idStr := chi.URLParam(r, "id")
 	id, err := uuid.Parse(idStr)
 	if err != nil {

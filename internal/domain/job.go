@@ -35,16 +35,17 @@ const (
 //   - Attempts is incremented on each execution. When attempts >= MaxAttempts,
 //     the job is marked as permanently failed (dead letter).
 type Job struct {
-	ID           uuid.UUID       `json:"id"`
-	Type         string          `json:"type"`
-	Payload      json.RawMessage `json:"payload"`
-	Status       JobStatus       `json:"status"`
-	Result       json.RawMessage `json:"result,omitempty"`
-	Error        string          `json:"error,omitempty"`
-	Attempts     int             `json:"attempts"`
-	MaxAttempts  int             `json:"maxAttempts"`
-	ScheduledAt  time.Time       `json:"scheduledAt"`
-	StartedAt    *time.Time      `json:"startedAt,omitempty"`
-	CompletedAt  *time.Time      `json:"completedAt,omitempty"`
-	CreatedAt    time.Time       `json:"createdAt"`
+	ID          uuid.UUID       `json:"id"`
+	TenantID    uuid.UUID       `json:"tenantId"`
+	Type        string          `json:"type"`
+	Payload     json.RawMessage `json:"payload"`
+	Status      JobStatus       `json:"status"`
+	Result      json.RawMessage `json:"result,omitempty"`
+	Error       string          `json:"error,omitempty"`
+	Attempts    int             `json:"attempts"`
+	MaxAttempts int             `json:"maxAttempts"`
+	ScheduledAt time.Time       `json:"scheduledAt"`
+	StartedAt   *time.Time      `json:"startedAt,omitempty"`
+	CompletedAt *time.Time      `json:"completedAt,omitempty"`
+	CreatedAt   time.Time       `json:"createdAt"`
 }

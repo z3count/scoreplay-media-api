@@ -8,7 +8,21 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scoreplay/media-api/internal/domain"
+	"github.com/scoreplay/media-api/internal/port"
 )
+
+// testCtx returns a context carrying the legacy-tenant identity. The
+// storage adapter reads the tenant from ctx to build per-tenant key
+// prefixes; tests that don't go through the auth middleware need to
+// inject one explicitly.
+func testCtx() context.Context {
+	return port.WithIdentity(context.Background(), domain.Identity{
+		TenantID: domain.LegacyTenantID,
+		Scopes:   []string{"admin:*"},
+	})
+}
 
 // TestStorage_Save_CreatesFile verifies that Save creates a file in the correct
 // hash-sharded directory structure and returns a valid relative path.
@@ -20,15 +34,20 @@ func TestStorage_Save_CreatesFile(t *testing.T) {
 	}
 
 	content := "test file content"
-	path, err := storage.Save(context.Background(), strings.NewReader(content), ".jpg")
+	path, err := storage.Save(testCtx(), strings.NewReader(content), ".jpg")
 	if err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	// Verify the path has the expected sharded structure: x/y/z/uuid.jpg
+	// Verify the path has the expected sharded structure: <tenant>/x/y/z/uuid.jpg.
+	// The leading component is the tenant UUID (added by the tenancy
+	// migration); the remaining three are the hash-shard tree.
 	parts := strings.Split(path, string(filepath.Separator))
-	if len(parts) != 4 {
-		t.Errorf("expected 4 path components (a/b/c/file), got %d: %s", len(parts), path)
+	if len(parts) != 5 {
+		t.Errorf("expected 5 path components (tenant/a/b/c/file), got %d: %s", len(parts), path)
+	}
+	if parts[0] != domain.LegacyTenantID.String() {
+		t.Errorf("expected tenant prefix %s, got %s", domain.LegacyTenantID, parts[0])
 	}
 	if !strings.HasSuffix(path, ".jpg") {
 		t.Errorf("expected .jpg extension, got: %s", path)
@@ -56,7 +75,7 @@ func TestStorage_Save_MultipleFiles(t *testing.T) {
 
 	paths := make(map[string]bool)
 	for i := 0; i < 100; i++ {
-		path, err := storage.Save(context.Background(), strings.NewReader("data"), ".png")
+		path, err := storage.Save(testCtx(), strings.NewReader("data"), ".png")
 		if err != nil {
 			t.Fatalf("Save %d: %v", i, err)
 		}
@@ -76,12 +95,12 @@ func TestStorage_Delete_ExistingFile(t *testing.T) {
 		t.Fatalf("NewStorage: %v", err)
 	}
 
-	path, err := storage.Save(context.Background(), strings.NewReader("data"), ".jpg")
+	path, err := storage.Save(testCtx(), strings.NewReader("data"), ".jpg")
 	if err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	err = storage.Delete(context.Background(), path)
+	err = storage.Delete(testCtx(), path)
 	if err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -102,7 +121,7 @@ func TestStorage_Delete_NonExistent(t *testing.T) {
 		t.Fatalf("NewStorage: %v", err)
 	}
 
-	err = storage.Delete(context.Background(), "does/not/exist.jpg")
+	err = storage.Delete(testCtx(), "does/not/exist.jpg")
 	if err != nil {
 		t.Errorf("expected nil error for non-existent file, got: %v", err)
 	}
@@ -148,7 +167,7 @@ func TestStorage_Save_LargeFile(t *testing.T) {
 	size := 1024 * 1024
 	reader := io.LimitReader(&infiniteReader{}, int64(size))
 
-	path, err := storage.Save(context.Background(), reader, ".mp4")
+	path, err := storage.Save(testCtx(), reader, ".mp4")
 	if err != nil {
 		t.Fatalf("Save: %v", err)
 	}

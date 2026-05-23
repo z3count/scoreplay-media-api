@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/scoreplay/media-api/internal/adapter/http/handler"
 	appmw "github.com/scoreplay/media-api/internal/adapter/http/middleware"
@@ -55,7 +56,8 @@ func NewRouter(
 	tagHandler *handler.TagHandler,
 	mediaHandler *handler.MediaHandler,
 	uploadDir string,
-	apiKey string,
+	authVerifier port.AuthVerifier,
+	devTenantID *uuid.UUID,
 	corsOrigins []string,
 	requestTimeout time.Duration,
 	rateLimitRPS float64,
@@ -92,9 +94,11 @@ func NewRouter(
 	// API v1 routes.
 	r.Route("/api/v1", func(r chi.Router) {
 		// API key authentication on all API routes.
-		// When apiKey is empty, the middleware is a no-op (dev mode).
+		// devTenantID enables a dev-mode bypass: when non-nil, requests
+		// without a credential are accepted as that tenant with admin:*
+		// scope. Production sets it to nil so all requests must auth.
 		// OWASP: logger is passed to enable auth failure logging for brute-force detection.
-		r.Use(appmw.APIKeyAuth(apiKey, logger))
+		r.Use(appmw.APIKeyAuth(authVerifier, devTenantID, logger))
 
 		// Tag routes.
 		r.Route("/tags", func(r chi.Router) {

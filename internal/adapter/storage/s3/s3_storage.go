@@ -21,6 +21,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
+
+	"github.com/scoreplay/media-api/internal/port"
 )
 
 // Storage implements port.FileStorage backed by an S3 bucket.
@@ -123,9 +125,19 @@ func NewStorage(ctx context.Context, cfg Config) (*Storage, error) {
 // independently, so peak memory is bounded by the chunk size × upload
 // concurrency regardless of the total upload size.
 func (s *Storage) Save(ctx context.Context, reader io.Reader, ext string) (string, error) {
-	key := s.prefix + uuid.New().String() + ext
+	tenantID, err := port.TenantIDFromContext(ctx)
+	if err != nil {
+		return "", err
+	}
 
-	_, err := s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
+	// Object key shape: <prefix><tenant_id>/<uuid>.<ext>. The tenant id
+	// in the key gives object-level ownership in the bucket — useful for
+	// per-tenant lifecycle rules, S3 inventory reports, and ad-hoc
+	// debugging without consulting the DB. The bucket policy / IAM role
+	// is still the gatekeeper; the prefix is identification, not auth.
+	key := s.prefix + tenantID.String() + "/" + uuid.New().String() + ext
+
+	_, err = s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 		Body:   reader,

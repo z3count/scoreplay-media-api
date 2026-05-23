@@ -29,6 +29,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	migratepg "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -40,6 +41,7 @@ import (
 	sqsadapter "github.com/scoreplay/media-api/internal/adapter/sqs"
 	"github.com/scoreplay/media-api/internal/adapter/storage/local"
 	s3storage "github.com/scoreplay/media-api/internal/adapter/storage/s3"
+	"github.com/scoreplay/media-api/internal/domain"
 	"github.com/scoreplay/media-api/internal/port"
 	"github.com/scoreplay/media-api/internal/service"
 )
@@ -242,7 +244,27 @@ func run(logger *slog.Logger) error {
 	mediaHandler := handler.NewMediaHandler(mediaSvc, logger, cfg.MaxUploadSize)
 	healthHandler := handler.NewHealthHandler(db)
 
-	router := appserver.NewRouter(healthHandler, tagHandler, mediaHandler, cfg.UploadDir, cfg.APIKey, cfg.CORSOrigins, cfg.RequestTimeout, cfg.RateLimitRPS, cfg.RateLimitBurst, idempotencyStore, logger)
+	// Step 5b: Multi-tenant authentication.
+	// Ensure the "legacy" tenant exists and, when API_KEY is set,
+	// register that key against it. This preserves the pre-tenancy
+	// dev experience (one API_KEY env var = one credential) while
+	// modelling it as a real tenant + api_key pair in the DB.
+	authVerifier := pgadapter.NewAuthVerifier(db, 5*time.Second)
+	if err := authVerifier.EnsureLegacyTenant(context.Background(), cfg.APIKey); err != nil {
+		return fmt.Errorf("ensure legacy tenant: %w", err)
+	}
+
+	// devTenantID enables a development bypass: when API_KEY is empty,
+	// unauthenticated requests are treated as the legacy tenant with
+	// admin:* scope. Production sets API_KEY (devTenantID = nil), so
+	// every request must present a valid credential.
+	var devTenantID *uuid.UUID
+	if cfg.APIKey == "" {
+		t := domain.LegacyTenantID
+		devTenantID = &t
+	}
+
+	router := appserver.NewRouter(healthHandler, tagHandler, mediaHandler, cfg.UploadDir, authVerifier, devTenantID, cfg.CORSOrigins, cfg.RequestTimeout, cfg.RateLimitRPS, cfg.RateLimitBurst, idempotencyStore, logger)
 
 	// Step 6: Configure and start HTTP server.
 	srv := &http.Server{
