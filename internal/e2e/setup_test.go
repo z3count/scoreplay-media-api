@@ -45,6 +45,7 @@ const testAPIKey = "test-api-key-e2e"
 // the HTTP server, and the base URL to send requests to.
 type testEnv struct {
 	db        *sql.DB
+	dsn       string // postgres DSN — kept so individual tests can open a second connection
 	server    *http.Server
 	baseURL   string
 	uploadDir string
@@ -173,6 +174,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 
 	return &testEnv{
 		db:        db,
+		dsn:       connStr,
 		server:    srv,
 		baseURL:   baseURL,
 		uploadDir: uploadDir,

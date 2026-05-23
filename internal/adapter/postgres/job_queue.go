@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/scoreplay/media-api/internal/domain"
-	"github.com/scoreplay/media-api/internal/port"
 )
 
 // JobQueue implements port.JobQueue using PostgreSQL.
@@ -34,20 +33,17 @@ func NewJobQueue(db *sql.DB) *JobQueue {
 // handler's context at dequeue time so any downstream repo/storage call
 // inherits the right scope.
 func (q *JobQueue) Enqueue(ctx context.Context, jobType string, payload json.RawMessage) (uuid.UUID, error) {
-	tenantID, err := port.TenantIDFromContext(ctx)
-	if err != nil {
-		return uuid.Nil, err
-	}
 	if payload == nil {
 		payload = json.RawMessage("{}")
 	}
 
 	var id uuid.UUID
-	err = q.db.QueryRowContext(ctx,
-		`INSERT INTO jobs (tenant_id, type, payload) VALUES ($1, $2, $3) RETURNING id`,
-		tenantID, jobType, payload,
-	).Scan(&id)
-
+	err := withTenantTx(ctx, q.db, func(tx *sql.Tx, tenantID uuid.UUID) error {
+		return tx.QueryRowContext(ctx,
+			`INSERT INTO jobs (tenant_id, type, payload) VALUES ($1, $2, $3) RETURNING id`,
+			tenantID, jobType, payload,
+		).Scan(&id)
+	})
 	return id, err
 }
 
@@ -70,29 +66,39 @@ func (q *JobQueue) Dequeue(ctx context.Context) (*domain.Job, error) {
 	var job domain.Job
 	var payload, result []byte
 	var startedAt, completedAt sql.NullTime
+	found := false
 
-	err := q.db.QueryRowContext(ctx, `
-		UPDATE jobs SET status = 'running', started_at = now(), attempts = attempts + 1
-		WHERE id = (
-			SELECT id FROM jobs
-			WHERE status = 'pending' AND scheduled_at <= now()
-			ORDER BY scheduled_at
-			FOR UPDATE SKIP LOCKED
-			LIMIT 1
+	err := withSystemTx(ctx, q.db, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `
+			UPDATE jobs SET status = 'running', started_at = now(), attempts = attempts + 1
+			WHERE id = (
+				SELECT id FROM jobs
+				WHERE status = 'pending' AND scheduled_at <= now()
+				ORDER BY scheduled_at
+				FOR UPDATE SKIP LOCKED
+				LIMIT 1
+			)
+			RETURNING id, tenant_id, type, payload, status, result, error, attempts, max_attempts,
+			          scheduled_at, started_at, completed_at, created_at
+		`).Scan(
+			&job.ID, &job.TenantID, &job.Type, &payload, &job.Status, &result, &job.Error,
+			&job.Attempts, &job.MaxAttempts, &job.ScheduledAt, &startedAt,
+			&completedAt, &job.CreatedAt,
 		)
-		RETURNING id, tenant_id, type, payload, status, result, error, attempts, max_attempts,
-		          scheduled_at, started_at, completed_at, created_at
-	`).Scan(
-		&job.ID, &job.TenantID, &job.Type, &payload, &job.Status, &result, &job.Error,
-		&job.Attempts, &job.MaxAttempts, &job.ScheduledAt, &startedAt,
-		&completedAt, &job.CreatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		return nil
+	})
 	if err != nil {
 		return nil, err
+	}
+	if !found {
+		return nil, nil
 	}
 
 	job.Payload = payload
@@ -103,18 +109,21 @@ func (q *JobQueue) Dequeue(ctx context.Context) (*domain.Job, error) {
 	if completedAt.Valid {
 		job.CompletedAt = &completedAt.Time
 	}
-
 	return &job, nil
 }
 
 // Complete marks a job as successfully completed with the given result.
+// System-mode: ownership of the job is established by the prior Dequeue
+// call (which locked the row); subsequent ops are addressed by id.
 func (q *JobQueue) Complete(ctx context.Context, id uuid.UUID, result json.RawMessage) error {
-	_, err := q.db.ExecContext(ctx,
-		`UPDATE jobs SET status = 'completed', result = $2, completed_at = now()
-		 WHERE id = $1`,
-		id, result,
-	)
-	return err
+	return withSystemTx(ctx, q.db, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET status = 'completed', result = $2, completed_at = now()
+			 WHERE id = $1`,
+			id, result,
+		)
+		return err
+	})
 }
 
 // Fail handles job failure with automatic retry logic.
@@ -125,25 +134,27 @@ func (q *JobQueue) Complete(ctx context.Context, id uuid.UUID, result json.RawMe
 //   - Attempt 2 fails → retry in 60s
 //   - Attempt 3 fails → permanently marked as 'failed' (dead letter)
 func (q *JobQueue) Fail(ctx context.Context, id uuid.UUID, errMsg string) error {
-	_, err := q.db.ExecContext(ctx, `
-		UPDATE jobs SET
-			error = $2,
-			status = CASE
-				WHEN attempts >= max_attempts THEN 'failed'
-				ELSE 'pending'
-			END,
-			scheduled_at = CASE
-				WHEN attempts >= max_attempts THEN scheduled_at
-				ELSE now() + (30 * power(2, attempts - 1)) * INTERVAL '1 second'
-			END,
-			completed_at = CASE
-				WHEN attempts >= max_attempts THEN now()
-				ELSE NULL
-			END
-		WHERE id = $1`,
-		id, errMsg,
-	)
-	return err
+	return withSystemTx(ctx, q.db, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE jobs SET
+				error = $2,
+				status = CASE
+					WHEN attempts >= max_attempts THEN 'failed'
+					ELSE 'pending'
+				END,
+				scheduled_at = CASE
+					WHEN attempts >= max_attempts THEN scheduled_at
+					ELSE now() + (30 * power(2, attempts - 1)) * INTERVAL '1 second'
+				END,
+				completed_at = CASE
+					WHEN attempts >= max_attempts THEN now()
+					ELSE NULL
+				END
+			WHERE id = $1`,
+			id, errMsg,
+		)
+		return err
+	})
 }
 
 // QueueStats is a point-in-time snapshot of queue depth used for saturation
@@ -165,13 +176,15 @@ func (q *JobQueue) Stats(ctx context.Context) (QueueStats, error) {
 	var s QueueStats
 	var oldestSeconds sql.NullFloat64
 
-	err := q.db.QueryRowContext(ctx, `
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending' AND scheduled_at <= now()),
-			COUNT(*) FILTER (WHERE status = 'running'),
-			EXTRACT(EPOCH FROM (now() - MIN(scheduled_at) FILTER (WHERE status = 'pending' AND scheduled_at <= now())))
-		FROM jobs
-	`).Scan(&s.Pending, &s.Running, &oldestSeconds)
+	err := withSystemTx(ctx, q.db, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE status = 'pending' AND scheduled_at <= now()),
+				COUNT(*) FILTER (WHERE status = 'running'),
+				EXTRACT(EPOCH FROM (now() - MIN(scheduled_at) FILTER (WHERE status = 'pending' AND scheduled_at <= now())))
+			FROM jobs
+		`).Scan(&s.Pending, &s.Running, &oldestSeconds)
+	})
 	if err != nil {
 		return QueueStats{}, err
 	}
@@ -183,17 +196,23 @@ func (q *JobQueue) Stats(ctx context.Context) (QueueStats, error) {
 
 // Cleanup removes completed and failed jobs older than the given number of days.
 // Returns the number of rows deleted. Should be called periodically (e.g., daily).
+// System-mode: this op spans all tenants by design.
 func (q *JobQueue) Cleanup(ctx context.Context, olderThanDays int) (int64, error) {
-	result, err := q.db.ExecContext(ctx,
-		`DELETE FROM jobs
-		 WHERE status IN ('completed', 'failed')
-		   AND completed_at < now() - ($1 || ' days')::INTERVAL`,
-		olderThanDays,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+	var affected int64
+	err := withSystemTx(ctx, q.db, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx,
+			`DELETE FROM jobs
+			 WHERE status IN ('completed', 'failed')
+			   AND completed_at < now() - ($1 || ' days')::INTERVAL`,
+			olderThanDays,
+		)
+		if err != nil {
+			return err
+		}
+		affected, err = result.RowsAffected()
+		return err
+	})
+	return affected, err
 }
 
 // startCleanupLoop runs periodic cleanup of old jobs.

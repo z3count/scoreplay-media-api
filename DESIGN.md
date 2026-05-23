@@ -479,9 +479,13 @@ federations) sharing the platform; a club's media must never leak to
 another. **Phase 1 has shipped**: schema, ports, repository filtering,
 storage prefixing, scope-gated handlers, and the load-bearing
 cross-tenant isolation test. **Phase 2 (Row-Level Security as
-defence-in-depth)** is deferred — it needs per-connection state
-plumbing that's a separate refactor. The application-level WHERE
-clauses + the integration test cover the correctness guarantee today.
+defence-in-depth) has shipped too**: migration 006 enables FORCE RLS on
+every tenant table with a dual-mode policy (tenant_isolation +
+system_bypass), every repo method runs inside `withTenantTx` or
+`withSystemTx`, and a dedicated E2E test
+(`internal/e2e/rls_test.go`) connects as a non-superuser role and
+proves Postgres refuses cross-tenant reads/writes even when the
+application's `WHERE tenant_id = $X` filter is absent.
 
 **Shape (decisions taken)**
 
@@ -550,19 +554,31 @@ clauses + the integration test cover the correctness guarantee today.
    repository method calls `port.TenantIDFromContext` and includes
    `tenant_id` in INSERT / SELECT / UPDATE / DELETE. Storage adapters
    prefix the key with `<tenant_id>/…`.
-5. **Phase 2 (deferred).** Enable RLS on each table. Needs the
-   repository acquire-conn path to run `SET LOCAL app.tenant_id = …`
-   at the start of every request-scoped transaction. That's a separate
-   refactor; the WHERE clauses already filter today and the isolation
-   test enforces the contract.
+5. **✓ Shipped (migration 006).** Enabled `FORCE ROW LEVEL SECURITY`
+   on every tenant table (`tags`, `media`, `media_tags`,
+   `idempotency_keys`, `jobs`) with two permissive policies per table:
+   `tenant_isolation` (`tenant_id = app_current_tenant()`) and
+   `system_bypass` (`app_system_mode()`). Two SQL helpers —
+   `app_current_tenant()` and `app_system_mode()` — read the
+   transaction-scoped `app.tenant_id` and `app.system_mode` session
+   variables and `NULLIF` away the empty-string default so an unset
+   tenant comes out as NULL (which fails the `=` predicate, giving
+   default-deny). The Go side uses two transaction wrappers,
+   `postgres.withTenantTx` and `postgres.withSystemTx`
+   (`internal/adapter/postgres/tx.go`), to `SET LOCAL` the right
+   variable per request before any query runs. Cross-tenant reads,
+   writes, and cross-tenant INSERTs are all refused server-side; an
+   unset session sees zero rows. The `tenants` and `api_keys` tables
+   are intentionally **not** under RLS — they're consulted by the auth
+   verifier before any tenant context exists.
 6. **✓ Shipped.** Cut over `APIKeyAuth` to the new verifier. Dev-mode
    bypass (`API_KEY=""` → legacy tenant identity) preserved for local
    development.
 7. **✓ Shipped.** The migration drops the `tenant_id` default after
-   backfill, so new writes must be explicit. With RLS still pending,
-   the application-level WHERE clauses + the cross-tenant integration
-   test give two layers of "this query is tenant-scoped" today; Phase 2
-   adds the third.
+   backfill, so new writes must be explicit. With Phase 2 also in,
+   three independent layers now enforce tenancy: the type system
+   (NOT NULL `tenant_id`), the application-level WHERE clauses + the
+   cross-tenant isolation test, and Postgres RLS as defence in depth.
 
 **Tests**
 
@@ -587,10 +603,13 @@ The load-bearing test is **cross-tenant data isolation**.
   indirectly by the isolation E2E today; explicit unit tests would
   catch error-classification regressions earlier.
 - **Open — Unit (`APIKeyAuth` middleware)** — same rationale.
-- **Phase 2 — Integration (RLS backstop)** — set `app.tenant_id` to
-  tenant A and execute the same SQL the app would issue *without* the
-  application-level WHERE clause; Postgres must still filter to A only.
-  Lands together with the RLS policies.
+- **✓ Integration — RLS backstop** (`internal/e2e/rls_test.go`).
+  Connects as a non-superuser role and verifies four scenarios:
+  with `app.tenant_id = A`, only A's rows are visible from an
+  unfiltered `SELECT *`; with no session var set, zero rows
+  (default-deny); with `app.system_mode = '1'`, all rows visible
+  (bypass); a cross-tenant INSERT under tenant A's session is
+  rejected by the `WITH CHECK` clause.
 - **Open — Load (rate-limit isolation)** — flood tenant A; tenant B
   remains responsive.
 

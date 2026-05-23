@@ -60,42 +60,37 @@ func NewTagRepo(db *sql.DB) *TagRepo {
 //   - Empty or whitespace-only names: should be rejected at the service layer
 //     before reaching this method.
 func (r *TagRepo) CreateOrGet(ctx context.Context, name string) (domain.Tag, bool, error) {
-	tenantID, err := port.TenantIDFromContext(ctx)
+	var tag domain.Tag
+	var created bool
+	err := withTenantTx(ctx, r.db, func(tx *sql.Tx, tenantID uuid.UUID) error {
+		// Attempt to insert. If a conflict on (tenant_id, name) occurs, do nothing.
+		// RETURNING gives us the row only if an insert actually happened.
+		err := tx.QueryRowContext(ctx,
+			`INSERT INTO tags (tenant_id, name) VALUES ($1, $2)
+			 ON CONFLICT (tenant_id, name) DO NOTHING
+			 RETURNING id, name, created_at`,
+			tenantID, name,
+		).Scan(&tag.ID, &tag.Name, &tag.CreatedAt)
+		if err == nil {
+			created = true
+			return nil
+		}
+		if err != sql.ErrNoRows {
+			return fmt.Errorf("insert tag: %w", err)
+		}
+		// ON CONFLICT fired: fetch the existing row.
+		if err := tx.QueryRowContext(ctx,
+			`SELECT id, name, created_at FROM tags WHERE tenant_id = $1 AND name = $2`,
+			tenantID, name,
+		).Scan(&tag.ID, &tag.Name, &tag.CreatedAt); err != nil {
+			return fmt.Errorf("select existing tag: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return domain.Tag{}, false, err
 	}
-
-	// Attempt to insert. If a conflict on (tenant_id, name) occurs, do nothing.
-	// RETURNING gives us the row only if an insert actually happened.
-	var tag domain.Tag
-	err = r.db.QueryRowContext(ctx,
-		`INSERT INTO tags (tenant_id, name) VALUES ($1, $2)
-		 ON CONFLICT (tenant_id, name) DO NOTHING
-		 RETURNING id, name, created_at`,
-		tenantID, name,
-	).Scan(&tag.ID, &tag.Name, &tag.CreatedAt)
-
-	if err == nil {
-		// Insert succeeded: new tag was created.
-		return tag, true, nil
-	}
-
-	if err != sql.ErrNoRows {
-		// Genuine database error (connection lost, syntax error, etc.).
-		return domain.Tag{}, false, fmt.Errorf("insert tag: %w", err)
-	}
-
-	// sql.ErrNoRows means the ON CONFLICT fired (tag already exists).
-	// Fetch the existing tag by (tenant_id, name).
-	err = r.db.QueryRowContext(ctx,
-		`SELECT id, name, created_at FROM tags WHERE tenant_id = $1 AND name = $2`,
-		tenantID, name,
-	).Scan(&tag.ID, &tag.Name, &tag.CreatedAt)
-	if err != nil {
-		return domain.Tag{}, false, fmt.Errorf("select existing tag: %w", err)
-	}
-
-	return tag, false, nil
+	return tag, created, nil
 }
 
 // List returns up to limit tags ordered by (name ASC, id ASC) using keyset
@@ -110,51 +105,54 @@ func (r *TagRepo) CreateOrGet(ctx context.Context, name string) (domain.Tag, boo
 // No COUNT(*) is performed: cursor pagination intentionally avoids the
 // linear-time scan that offset-based pagination required.
 func (r *TagRepo) List(ctx context.Context, limit int, cursor *port.TagCursor) ([]domain.Tag, *port.TagCursor, error) {
-	tenantID, err := port.TenantIDFromContext(ctx)
+	var tags []domain.Tag
+	var next *port.TagCursor
+	err := withTenantTx(ctx, r.db, func(tx *sql.Tx, tenantID uuid.UUID) error {
+		var rows *sql.Rows
+		var err error
+		if cursor == nil {
+			rows, err = tx.QueryContext(ctx,
+				`SELECT id, name, created_at FROM tags
+				 WHERE tenant_id = $1
+				 ORDER BY name ASC, id ASC
+				 LIMIT $2`,
+				tenantID, limit+1,
+			)
+		} else {
+			rows, err = tx.QueryContext(ctx,
+				`SELECT id, name, created_at FROM tags
+				 WHERE tenant_id = $1 AND (name, id) > ($2, $3)
+				 ORDER BY name ASC, id ASC
+				 LIMIT $4`,
+				tenantID, cursor.Name, cursor.ID, limit+1,
+			)
+		}
+		if err != nil {
+			return fmt.Errorf("list tags: %w", err)
+		}
+		defer rows.Close()
+
+		tags = make([]domain.Tag, 0, limit+1)
+		for rows.Next() {
+			var t domain.Tag
+			if err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt); err != nil {
+				return fmt.Errorf("scan tag: %w", err)
+			}
+			tags = append(tags, t)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate tags: %w", err)
+		}
+
+		if len(tags) > limit {
+			last := tags[limit-1]
+			next = &port.TagCursor{Name: last.Name, ID: last.ID}
+			tags = tags[:limit]
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, nil, err
-	}
-
-	var rows *sql.Rows
-	if cursor == nil {
-		rows, err = r.db.QueryContext(ctx,
-			`SELECT id, name, created_at FROM tags
-			 WHERE tenant_id = $1
-			 ORDER BY name ASC, id ASC
-			 LIMIT $2`,
-			tenantID, limit+1,
-		)
-	} else {
-		rows, err = r.db.QueryContext(ctx,
-			`SELECT id, name, created_at FROM tags
-			 WHERE tenant_id = $1 AND (name, id) > ($2, $3)
-			 ORDER BY name ASC, id ASC
-			 LIMIT $4`,
-			tenantID, cursor.Name, cursor.ID, limit+1,
-		)
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("list tags: %w", err)
-	}
-	defer rows.Close()
-
-	tags := make([]domain.Tag, 0, limit+1)
-	for rows.Next() {
-		var t domain.Tag
-		if err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt); err != nil {
-			return nil, nil, fmt.Errorf("scan tag: %w", err)
-		}
-		tags = append(tags, t)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("iterate tags: %w", err)
-	}
-
-	var next *port.TagCursor
-	if len(tags) > limit {
-		last := tags[limit-1]
-		next = &port.TagCursor{Name: last.Name, ID: last.ID}
-		tags = tags[:limit]
 	}
 	return tags, next, nil
 }
@@ -173,26 +171,27 @@ func (r *TagRepo) List(ctx context.Context, limit int, cursor *port.TagCursor) (
 // The caller (service) is responsible for sanitizing the name before
 // calling this method.
 func (r *TagRepo) Rename(ctx context.Context, id uuid.UUID, name string) (domain.Tag, error) {
-	tenantID, err := port.TenantIDFromContext(ctx)
+	var tag domain.Tag
+	err := withTenantTx(ctx, r.db, func(tx *sql.Tx, tenantID uuid.UUID) error {
+		err := tx.QueryRowContext(ctx,
+			`UPDATE tags SET name = $1 WHERE id = $2 AND tenant_id = $3
+			 RETURNING id, name, created_at`,
+			name, id, tenantID,
+		).Scan(&tag.ID, &tag.Name, &tag.CreatedAt)
+		if err == sql.ErrNoRows {
+			return domain.ErrNotFound
+		}
+		if err != nil {
+			var pqErr *pq.Error
+			if errors.As(err, &pqErr) && pqErr.Code == uniqueViolation {
+				return fmt.Errorf("%w: a tag with that name already exists", domain.ErrConflict)
+			}
+			return fmt.Errorf("rename tag: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return domain.Tag{}, err
-	}
-	var tag domain.Tag
-	err = r.db.QueryRowContext(ctx,
-		`UPDATE tags SET name = $1 WHERE id = $2 AND tenant_id = $3
-		 RETURNING id, name, created_at`,
-		name, id, tenantID,
-	).Scan(&tag.ID, &tag.Name, &tag.CreatedAt)
-
-	if err == sql.ErrNoRows {
-		return domain.Tag{}, domain.ErrNotFound
-	}
-	if err != nil {
-		var pqErr *pq.Error
-		if errors.As(err, &pqErr) && pqErr.Code == uniqueViolation {
-			return domain.Tag{}, fmt.Errorf("%w: a tag with that name already exists", domain.ErrConflict)
-		}
-		return domain.Tag{}, fmt.Errorf("rename tag: %w", err)
 	}
 	return tag, nil
 }
@@ -204,20 +203,18 @@ func (r *TagRepo) Rename(ctx context.Context, id uuid.UUID, name string) (domain
 // rather than a separate SELECT because DELETE is already atomic and
 // reporting "deleted nothing" needs no extra round-trip.
 func (r *TagRepo) Delete(ctx context.Context, id uuid.UUID) error {
-	tenantID, err := port.TenantIDFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	res, err := r.db.ExecContext(ctx, `DELETE FROM tags WHERE id = $1 AND tenant_id = $2`, id, tenantID)
-	if err != nil {
-		return fmt.Errorf("delete tag: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("delete tag rows affected: %w", err)
-	}
-	if n == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+	return withTenantTx(ctx, r.db, func(tx *sql.Tx, tenantID uuid.UUID) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM tags WHERE id = $1 AND tenant_id = $2`, id, tenantID)
+		if err != nil {
+			return fmt.Errorf("delete tag: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("delete tag rows affected: %w", err)
+		}
+		if n == 0 {
+			return domain.ErrNotFound
+		}
+		return nil
+	})
 }
