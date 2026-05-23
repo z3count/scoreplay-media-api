@@ -195,18 +195,17 @@ func TestE2E_S3Backend(t *testing.T) {
 	t.Log("S3 backend E2E passed: tag created, media uploaded to MinIO, retrieved, object verified")
 
 	// ===== Test 5: Presigned URL grants short-lived read access =====
-	// Find the object we just uploaded.
-	var key string
-	for obj := range mc.ListObjects(ctx, testBucket, minioclient.ListObjectsOptions{Recursive: true}) {
-		if obj.Err != nil {
-			t.Fatalf("list objects for presign: %v", obj.Err)
-		}
-		key = obj.Key
-		break
-	}
-	if key == "" {
+	// Find the object we just uploaded. ListObjects streams to a channel;
+	// we only need the first entry, so pull one without a loop (avoids
+	// staticcheck SA4004 "loop unconditionally terminated").
+	obj, ok := <-mc.ListObjects(ctx, testBucket, minioclient.ListObjectsOptions{Recursive: true})
+	if !ok {
 		t.Fatal("no object found in bucket for presign test")
 	}
+	if obj.Err != nil {
+		t.Fatalf("list objects for presign: %v", obj.Err)
+	}
+	key := obj.Key
 
 	signed, err := s3Store.URLWithExpiry(ctx, "", key, 1*time.Minute)
 	if err != nil {
