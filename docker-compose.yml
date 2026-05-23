@@ -1,0 +1,25 @@
+# docker-compose uses environment variables instead of hardcoded credentials.
+# Copy .env.example to .env and configure before running.
+# This prevents credentials from being committed to version control.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: scoreplay-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scoreplay}
+      # Default password for local development. Override via .env in production.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scoreplay}
+      POSTGRES_DB: ${POSTGRES_DB:-media_api}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scoreplay} -d ${POSTGRES_DB:-media_api}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

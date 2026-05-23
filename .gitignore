@@ -1,0 +1,23 @@
+# Binaries
+bin/
+*.exe
+
+# Uploads (generated at runtime)
+uploads/
+
+# NEVER commit .env files containing secrets
+.env
+
+# Test coverage
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

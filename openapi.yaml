@@ -1,0 +1,948 @@
+openapi: "3.0.3"
+
+info:
+  title: ScorePlay Media API
+  description: |
+    REST API for managing media files (photos and videos) with tag-based
+    organization. Built in Go following Clean Architecture principles.
+
+    ## Authentication
+
+    All `/api/v1/*` endpoints require an `X-API-Key` header when `API_KEY`
+    is configured on the server. Health, metrics, and file download endpoints
+    are publicly accessible.
+
+    ## Input Validation
+
+    All tag and media names go through a Unicode-aware sanitization pipeline:
+    - **NFC normalization** — prevents duplicate tags from different Unicode encodings.
+    - **Whitespace normalization** — Unicode whitespace (NBSP, em-space, ideographic space…) is replaced with ASCII space; multiple spaces are collapsed.
+    - **Rejected characters** — control chars, zero-width chars, bidi overrides, replacement char (U+FFFD).
+    - **All scripts supported** — Latin, CJK, Arabic, Hebrew, Emoji, etc.
+
+    ## Rate Limiting
+
+    Per-IP token bucket rate limiting is applied globally. Default: 10 req/s
+    sustained, burst of 30. Returns `429 Too Many Requests` with a
+    `Retry-After: 1` header when exceeded.
+
+    ## Idempotent Uploads
+
+    `POST /api/v1/media` supports an `Idempotency-Key` header to prevent
+    duplicate uploads on retries. The key is cached for 24 hours. Replayed
+    responses include an `Idempotency-Replayed: true` header. Error responses
+    are NOT cached.
+
+    ## Error Format
+
+    All errors follow a consistent JSON envelope:
+    ```json
+    {
+      "error": {
+        "code": "ERROR_CODE",
+        "message": "Human-readable description"
+      }
+    }
+    ```
+  version: "1.0.0"
+  contact:
+    name: ScorePlay Engineering
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: Health
+    description: Liveness and readiness probes for orchestrators
+  - name: Metrics
+    description: Prometheus metrics endpoint
+  - name: Tags
+    description: Tag management (CRUD)
+  - name: Media
+    description: Media file management (upload, list, get, delete)
+  - name: Files
+    description: Static file serving
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  # ===========================================================================
+  # Health
+  # ===========================================================================
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: |
+        Returns 200 if the process is alive. Does NOT check database
+        connectivity — a temporary DB outage should not trigger a restart.
+        Used by Kubernetes liveness probes.
+      security: []
+      operationId: liveness
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      description: |
+        Returns 200 if the service is ready to accept traffic (database is
+        reachable with a 2-second timeout). Returns 503 if the database is
+        unreachable. Used by Kubernetes readiness probes and load balancers.
+      security: []
+      operationId: readiness
+      responses:
+        "200":
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+        "503":
+          description: Service is not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthErrorResponse"
+              example:
+                status: error
+                details: database unreachable
+
+  # ===========================================================================
+  # Metrics
+  # ===========================================================================
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Prometheus metrics
+      description: |
+        Standard Prometheus exposition format. No authentication required.
+
+        Exposed metrics:
+        - `http_requests_total` (counter) — labels: `method`, `route`, `status`
+        - `http_request_duration_seconds` (histogram) — labels: `method`, `route`
+        - `http_requests_in_flight` (gauge)
+      security: []
+      operationId: metrics
+      responses:
+        "200":
+          description: Prometheus text format metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  # ===========================================================================
+  # Tags
+  # ===========================================================================
+  /api/v1/tags:
+    post:
+      tags: [Tags]
+      summary: Create a tag
+      description: |
+        Creates a new tag or returns the existing one if a tag with the same
+        name already exists (idempotent upsert). The name is sanitized
+        (NFC normalized, whitespace collapsed, unsafe characters rejected).
+      operationId: createTag
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTagRequest"
+            example:
+              name: Mbappé
+      responses:
+        "201":
+          description: Tag created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagEnvelope"
+        "200":
+          description: Tag already exists (returned existing)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagEnvelope"
+        "400":
+          description: Invalid input (empty name, too long, unsafe characters)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    get:
+      tags: [Tags]
+      summary: List tags
+      description: |
+        Returns a cursor-paginated list of all tags, ordered alphabetically by name.
+
+        Pass the `nextCursor` returned by the previous call as the `cursor`
+        query parameter to fetch the next page. The cursor is opaque — clients
+        should not parse it. When `hasMore` is false there are no more pages
+        and `nextCursor` is omitted.
+      operationId: listTags
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Paginated list of tags
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListTagsEnvelope"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/tags/{id}:
+    patch:
+      tags: [Tags]
+      summary: Rename a tag
+      description: |
+        Updates the name of an existing tag. The new name is sanitized the
+        same way as on creation (NFC normalization, whitespace collapse,
+        unsafe-character rejection). The `tags.name UNIQUE` constraint
+        enforces no duplicates — collisions return `409 Conflict`.
+        Renaming a tag to its current name is a no-op that returns 200.
+
+        The rename is reflected immediately in all media that reference
+        this tag (they share the same row).
+      operationId: updateTag
+      parameters:
+        - $ref: "#/components/parameters/TagId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateTagRequest"
+            example:
+              name: Mbappé
+      responses:
+        "200":
+          description: Tag renamed (or no-op if name unchanged)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagEnvelope"
+        "400":
+          description: Invalid UUID, malformed JSON, or invalid name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Tag not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Another tag already uses the new name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "415":
+          description: Content-Type is not application/json
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    delete:
+      tags: [Tags]
+      summary: Delete a tag
+      description: |
+        Removes a tag and (via `ON DELETE CASCADE` on `media_tags`) all of
+        its media associations. Media items themselves are not deleted —
+        they just lose this tag.
+      operationId: deleteTag
+      parameters:
+        - $ref: "#/components/parameters/TagId"
+      responses:
+        "204":
+          description: Tag deleted (empty body)
+        "400":
+          description: Invalid UUID format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Tag not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  # ===========================================================================
+  # Media
+  # ===========================================================================
+  /api/v1/media:
+    post:
+      tags: [Media]
+      summary: Upload a media file
+      description: |
+        Upload a photo or video file with a name and optional tag associations.
+
+        The server detects the content type by sniffing the file content —
+        the client's `Content-Type` header is never trusted. Supported types:
+        JPEG, PNG, GIF, WebP, MP4, WebM, MOV, AVI, MKV.
+
+        Files are stored using UUID-based, hash-sharded paths to prevent
+        filesystem hotspots and path traversal attacks.
+
+        ### Idempotency
+
+        Send an `Idempotency-Key` header (any unique string, UUID recommended)
+        to enable at-most-once semantics. On retry, the cached response is
+        replayed without re-executing the upload. Keys expire after 24 hours.
+        Error responses (4xx/5xx) are NOT cached.
+      operationId: createMedia
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Client-generated unique key for idempotent uploads.
+            On retry, the server replays the cached response (24h TTL).
+            Error responses are NOT cached.
+          schema:
+            type: string
+            example: 550e8400-e29b-41d4-a716-446655440000
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [name, file]
+              properties:
+                name:
+                  type: string
+                  description: Human-readable media name (1–255 chars, sanitized)
+                  example: Goal celebration
+                tags:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  description: |
+                    Tag UUIDs to associate. Can be repeated. Combined with
+                    `tag_names` and deduped server-side; the combined set
+                    caps at 50.
+                tag_names:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    Tag names to associate. Names are sanitized (NFC,
+                    whitespace, unsafe-char rejection) and resolved via
+                    idempotent CreateOrGet — names that don't exist yet are
+                    auto-created. Combined with `tags` and deduped
+                    server-side; the combined set caps at 50.
+
+                    This is the editor-friendly path: clients can upload
+                    "tag this with Mbappé and Ligue 1" in a single request
+                    without looking up UUIDs first.
+                  example: [Mbappé, Ligue 1]
+                file:
+                  type: string
+                  format: binary
+                  description: Image or video file
+      responses:
+        "201":
+          description: Media created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaEnvelope"
+        "400":
+          description: Missing name/file, invalid tag UUID, unsafe characters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: File exceeds max upload size (default 100MB)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "415":
+          description: File type is not a supported image or video
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    get:
+      tags: [Media]
+      summary: List media
+      description: |
+        Returns a cursor-paginated list of media items, ordered by creation
+        date (newest first). Optionally filter by tag — either by UUID
+        (`tag_id`) or by name (`tag_name`).
+
+        Both filter parameters are **repeatable** for multi-tag AND queries:
+        `?tag_id=A&tag_id=B` returns media tagged with **both** A and B.
+        Up to 50 tag filters per request; duplicates are deduplicated server
+        side.
+
+        `tag_id` and `tag_name` are **mutually exclusive**: sending both
+        kinds returns `400 VALIDATION_ERROR`.
+
+        The `tag_name` values are normalized server-side (NFC, whitespace
+        collapse, leading/trailing trim) so `?tag_name=  Mbappé  ` matches
+        the stored canonical "Mbappé".
+
+        Pass the `nextCursor` returned by the previous call as the `cursor`
+        query parameter to fetch the next page. The cursor is opaque.
+      operationId: listMedia
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: tag_id
+          in: query
+          required: false
+          description: |
+            Filter media by tag UUID(s). Repeat the parameter for multi-tag
+            AND filtering (e.g. `?tag_id=A&tag_id=B`). Mutually exclusive
+            with `tag_name`.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+              format: uuid
+            maxItems: 50
+        - name: tag_name
+          in: query
+          required: false
+          description: |
+            Filter media by tag name(s). Repeat the parameter for multi-tag
+            AND filtering (e.g. `?tag_name=Mbappé&tag_name=Ligue+1`).
+            Mutually exclusive with `tag_id`.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+            maxItems: 50
+            example: [Mbappé, Ligue 1]
+      responses:
+        "200":
+          description: Paginated list of media
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListMediaEnvelope"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/media/{id}:
+    get:
+      tags: [Media]
+      summary: Get a media item
+      description: Returns a single media item by ID, including its associated tags.
+      operationId: getMedia
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+      responses:
+        "200":
+          description: Media item found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaEnvelope"
+        "400":
+          description: Invalid UUID format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Media not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    delete:
+      tags: [Media]
+      summary: Delete a media item
+      description: |
+        Removes the media record from the database and deletes the associated
+        file from storage (local or S3). Tag associations (`media_tags`) are
+        removed automatically via `ON DELETE CASCADE`.
+
+        Deletion order: DB first (source of truth), then file cleanup.
+        If file cleanup fails, the operation still succeeds — orphaned files
+        can be cleaned up by a periodic garbage collection job.
+      operationId: deleteMedia
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+      responses:
+        "204":
+          description: Media deleted (empty body)
+        "400":
+          description: Invalid UUID format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Media not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/media/{id}/tags:
+    post:
+      tags: [Media]
+      summary: Attach tags to an existing media
+      description: |
+        Adds tag associations to an existing media item without
+        re-uploading the file. The body shape mirrors media creation:
+        clients can pass tag UUIDs they already know about and/or tag
+        names (auto-created via the same idempotent CreateOrGet path as
+        `POST /api/v1/tags`). Both fields are additive and merged
+        server-side; the combined input is capped at 50.
+
+        Re-attaching a tag that's already linked is a no-op — the
+        operation is idempotent so retries are safe.
+
+        Returns the refreshed media so the caller doesn't need a follow-up
+        GET to see the new tag list.
+      operationId: attachMediaTags
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AttachTagsRequest"
+            example:
+              tags: ["550e8400-e29b-41d4-a716-446655440000"]
+              tag_names: ["Mbappé", "Ligue 1"]
+      responses:
+        "200":
+          description: Tags attached; body is the refreshed media
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaEnvelope"
+        "400":
+          description: Invalid UUID, malformed JSON, unsafe tag name, too many tags, or a tag id that doesn't exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Media not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "415":
+          description: Content-Type is not application/json
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/media/{id}/tags/{tag_id}:
+    delete:
+      tags: [Media]
+      summary: Detach one tag from a media
+      description: |
+        Removes a single `(media_id, tag_id)` row from `media_tags`. The
+        tag itself is **not** deleted — other media that reference it are
+        unaffected.
+
+        Idempotent: removing a link that doesn't exist returns 204 as
+        well, so retries don't race.
+      operationId: detachMediaTag
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - name: tag_id
+          in: path
+          required: true
+          description: UUID of the tag to unlink
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Tag unlinked (or wasn't linked)
+        "400":
+          description: Invalid media or tag UUID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Media not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  # ===========================================================================
+  # Static Files
+  # ===========================================================================
+  /uploads/{filepath}:
+    get:
+      tags: [Files]
+      summary: Download a media file
+      description: |
+        Serves the uploaded file with `Content-Disposition: attachment` to
+        prevent stored XSS. Directory listing is disabled.
+      security: []
+      operationId: downloadFile
+      parameters:
+        - name: filepath
+          in: path
+          required: true
+          description: Hash-sharded file path (e.g., `4/f/3/uuid.jpg`)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: File content
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: "Always `attachment` to prevent browser execution"
+            X-Content-Type-Options:
+              schema:
+                type: string
+              description: "Always `nosniff`"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: File not found
+
+# =============================================================================
+# Components
+# =============================================================================
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        API key for authentication. Set via the `API_KEY` environment variable.
+        When empty, authentication is disabled (development mode).
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: "Items per page (default: 50, max: 100)"
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Opaque cursor from a previous response's `pagination.nextCursor`.
+        Omit (or pass an empty string) to request the first page.
+      schema:
+        type: string
+
+    MediaId:
+      name: id
+      in: path
+      required: true
+      description: Media UUID
+      schema:
+        type: string
+        format: uuid
+
+    TagId:
+      name: id
+      in: path
+      required: true
+      description: Tag UUID
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    RateLimited:
+      description: Too many requests — rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: string
+          description: Seconds to wait before retrying
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: RATE_LIMITED
+              message: too many requests
+
+  schemas:
+    # --- Common ---
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              description: Human-readable error description
+              example: "tag name is required"
+          required: [code, message]
+      required: [error]
+
+    Pagination:
+      type: object
+      description: |
+        Cursor-based pagination metadata. There is no `total` field by design:
+        cursor pagination intentionally avoids the linear COUNT(*) scan that
+        offset pagination required.
+      properties:
+        limit:
+          type: integer
+          description: Number of items returned in this page
+          example: 50
+        nextCursor:
+          type: string
+          description: |
+            Opaque cursor to fetch the next page. Pass it back as the `cursor`
+            query parameter. Omitted from the response when there are no more
+            pages.
+          example: eyJuIjoiTWJhcHDDqSIsImkiOiI1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwMDAifQ
+        hasMore:
+          type: boolean
+          description: True if more pages are available
+      required: [limit, hasMore]
+
+    # --- Health ---
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok]
+      required: [status]
+
+    HealthErrorResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [error]
+        details:
+          type: string
+          description: Description of the failing dependency
+      required: [status, details]
+
+    # --- Tags ---
+    CreateTagRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: |
+            Tag name. Sanitized via NFC normalization, whitespace
+            collapsing, and unsafe character rejection.
+            All scripts are supported (Latin, CJK, Arabic, Emoji…).
+          example: Mbappé
+
+    UpdateTagRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: |
+            New tag name. Same sanitization pipeline as creation. The
+            tags.name UNIQUE constraint enforces no duplicates — collisions
+            return 409.
+          example: Mbappé
+
+    AttachTagsRequest:
+      type: object
+      description: |
+        Either or both fields may be present. The combined deduped set is
+        capped at 50.
+      properties:
+        tags:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Tag UUIDs to attach (caller already knows them)
+          maxItems: 50
+        tag_names:
+          type: array
+          items:
+            type: string
+          description: |
+            Tag names to attach. Sanitized the same way as on creation;
+            names that don't exist are auto-created via CreateOrGet.
+          maxItems: 50
+          example: [Mbappé, Ligue 1]
+
+    Tag:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 550e8400-e29b-41d4-a716-446655440000
+        name:
+          type: string
+          example: Mbappé
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-05-21T12:00:00Z"
+      required: [id, name, createdAt]
+
+    TagEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/Tag"
+      required: [data]
+
+    ListTagsEnvelope:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            tags:
+              type: array
+              items:
+                $ref: "#/components/schemas/Tag"
+            pagination:
+              $ref: "#/components/schemas/Pagination"
+          required: [tags, pagination]
+      required: [data]
+
+    # --- Media ---
+    Media:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 772a9622-e29b-41d4-a716-446655440001
+        name:
+          type: string
+          example: Goal celebration
+        type:
+          type: string
+          enum: [image, video]
+          example: image
+        originalName:
+          type: string
+          description: Original client filename (for display, never used in paths)
+          example: photo.jpg
+        fileSize:
+          type: integer
+          format: int64
+          description: File size in bytes
+          example: 2048576
+        fileUrl:
+          type: string
+          format: uri
+          description: Public URL to download the file
+          example: http://localhost:8080/uploads/4/f/3/772a9622.jpg
+        tags:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tag"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-05-21T12:00:00Z"
+      required: [id, name, type, originalName, fileSize, fileUrl, tags, createdAt]
+
+    MediaEnvelope:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/Media"
+      required: [data]
+
+    ListMediaEnvelope:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            media:
+              type: array
+              items:
+                $ref: "#/components/schemas/Media"
+            pagination:
+              $ref: "#/components/schemas/Pagination"
+          required: [media, pagination]
+      required: [data]

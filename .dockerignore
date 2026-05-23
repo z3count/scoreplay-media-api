@@ -1,0 +1,29 @@
+# Ignore everything that's not needed for the build.
+# OWASP: Isolate development environments from production.
+
+# Version control
+.git
+.gitignore
+
+# CI/CD
+.github
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Dev/test artifacts
+uploads/
+coverage.out
+coverage.html
+bin/
+
+# Environment files (NEVER include secrets in Docker context)
+.env
+.env.local
+
+# Documentation
+*.md
+LICENSE

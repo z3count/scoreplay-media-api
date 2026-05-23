@@ -1,0 +1,74 @@
+### ScorePlay Media API — Request Examples
+### Use with VS Code REST Client extension or copy as curl commands.
+
+### ===========================
+### Tags
+### ===========================
+
+### Create a tag
+POST http://localhost:8080/api/v1/tags
+Content-Type: application/json
+
+{
+  "name": "Mbappé"
+}
+
+### Create another tag
+POST http://localhost:8080/api/v1/tags
+Content-Type: application/json
+
+{
+  "name": "Ligue 1"
+}
+
+### Create a third tag
+POST http://localhost:8080/api/v1/tags
+Content-Type: application/json
+
+{
+  "name": "Paris Saint-Germain"
+}
+
+### List all tags (default pagination)
+GET http://localhost:8080/api/v1/tags
+
+### List tags with custom pagination
+GET http://localhost:8080/api/v1/tags?limit=10&offset=0
+
+### ===========================
+### Media
+### ===========================
+
+### Upload a media file (replace TAG_ID_1 and TAG_ID_2 with actual UUIDs from tag creation)
+# curl -X POST http://localhost:8080/api/v1/media \
+#   -F "name=Goal celebration" \
+#   -F "tags=TAG_ID_1" \
+#   -F "tags=TAG_ID_2" \
+#   -F "file=@/path/to/photo.jpg"
+
+### Retrieve a media by ID (replace MEDIA_ID with actual UUID)
+# GET http://localhost:8080/api/v1/media/MEDIA_ID
+
+### ===========================
+### Error cases (for testing)
+### ===========================
+
+### Create tag with empty name → 400
+POST http://localhost:8080/api/v1/tags
+Content-Type: application/json
+
+{
+  "name": "   "
+}
+
+### Create tag with invalid JSON → 400
+POST http://localhost:8080/api/v1/tags
+Content-Type: application/json
+
+not valid json
+
+### Get media with invalid UUID → 400
+GET http://localhost:8080/api/v1/media/not-a-uuid
+
+### Get non-existent media → 404
+GET http://localhost:8080/api/v1/media/00000000-0000-0000-0000-000000000000
